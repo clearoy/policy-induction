@@ -46,13 +46,24 @@ predict     ask Jev only the rules with non-zero weight; mean P(YES) of the 15
 
 ## Install
 
+With [uv](https://docs.astral.sh/uv/):
+
 ```bash
 cd policy-induction
-uv venv --python 3.13 .venv
-uv pip install --python .venv/bin/python -e ".[dev]"
+uv sync
 ```
 
-`requirements.txt` lists the runtime dependencies for a non-editable install.
+This creates `.venv` with the Python version in `.python-version`, installs the
+exact dependency versions recorded in `uv.lock` (including the dev tools), and
+installs `policy_induction` in editable mode. Run commands with `uv run`, e.g.
+`uv run pytest`, or use `.venv/bin/python` directly.
+
+Dependencies are declared in `pyproject.toml`; `uv.lock` pins every version
+so an experiment can be reproduced exactly. After changing dependencies, run
+`uv lock` and commit the updated lock file.
+
+Without uv: `pip install -e .` (plus `pytest pytest-asyncio` for the tests),
+which resolves versions from the ranges in `pyproject.toml` instead of the lock.
 
 > **macOS note.** macOS may set the "hidden" flag on the editable-install `.pth`
 > file, and Python 3.13 skips hidden `.pth` files, which makes `import
@@ -175,7 +186,7 @@ requires every rule to:
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q
+uv run pytest -q
 ```
 
 Fully offline: a fake generator and fake Jev on synthetic data check that
@@ -197,5 +208,6 @@ policy_induction/
 experiments/
   vcbench/run_vcbench.py
 tests/
-pyproject.toml
+pyproject.toml   dependencies
+uv.lock          pinned versions
 ```
