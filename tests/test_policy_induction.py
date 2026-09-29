@@ -260,3 +260,10 @@ async def test_deepseek_generator_json_mode_and_fallback(monkeypatch):
     assert await gen.generate("s", "p", 1.0) == ["`x` is long", "`x` is short"]
     assert await gen.generate("s", "p", 1.0) == ["`x` is long", "`x` is short"]
     assert calls == [True, False, False]
+
+
+def test_rules_accept_wrapped_objects():
+    from policy_induction.generator import parse_rules
+
+    text = '{"rules": [{"rule": "`a` is long"}, {"text": "`b` is short"}, "`c` is empty"]}'
+    assert parse_rules(text, "m") == ["`a` is long", "`b` is short", "`c` is empty"]
