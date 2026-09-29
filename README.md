@@ -11,32 +11,34 @@ LLM has never seen.
 ## How it works
 
 ```
-training data ──┬── P, show pool (30%):  the only rows whose labels the LLM sees
-                └── V, validation pool (70%): never shown; every score is measured here
-
-one rule pool, expand-only
+training data ──┬── P, show pool (20%):  the only rows whose labels the LLM sees
+                └── V, validation pool (80%): never shown; every decision is made here
 
 round 0     sample 20 YES + 20 NO rows from P -> the LLM writes seed rules
 round 1..R
-  1. fit L1 logistic regression on the pool -> out-of-fold P(YES) for every row
+  1. fit L1 logistic regression on the accepted rules -> out-of-fold P(YES)
   2. residual g = y - p; take the P rows of one class the model gets most wrong:
      missed YES rows on odd rounds, missed NO rows on even rounds, plus
      correctly handled rows of the same class as contrast
-  3. the LLM sees the whole pool (with weights) and those rows, and proposes
-     new rules -> Jev scores them on every row
-  4. a new rule joins the pool unless it is near-constant, a near-duplicate of
-     a pooled rule, or fits P but not V
-  5. refit on the grown pool; measure out-of-fold log-loss on V
-stop        the pool reaches max_policy_length, or 2 consecutive rounds each
-            lower V log-loss by less than rel_epsilon (0.3%, relative)
+  3. the LLM sees those rows, the accepted rules (with weights) and the rules
+     already tried without success, and proposes new rules -> Jev scores them
+  4. filter out rules that are near-constant, near-duplicates of an accepted
+     rule, or fit P but not V
+  5. try each survivor on its own: accept it only if the mean per-row
+     log-loss improvement on V exceeds one standard error
+stop        max_policy_length rules accepted, or 2 consecutive rounds each lower
+            V log-loss by less than rel_epsilon (0.1%, relative)
 finish      choose C by the one-standard-error rule, then the decision threshold
             on V's pooled out-of-fold probabilities
-predict     ask Jev only the rules with non-zero weight; mean P(YES) of the 15
-            fold models >= threshold -> YES
+predict     ask Jev only the accepted rules with non-zero weight; mean P(YES) of
+            the 15 fold models >= threshold -> YES
 ```
 
-- **Expand-only.** Nothing leaves the pool; L1 decides which rules carry
-  weight, so a rule that looked useless early can gain weight later.
+- **Each rule is tested on its own**, so a useful rule is not diluted by
+  weaker rules proposed in the same batch.
+- **Nothing is forgotten**: accepted rules are never removed (L1 shrinks any
+  that later rules make redundant), and rejected rules are listed in later
+  prompts so the LLM does not propose them again.
 - **Features are probabilities**: Jev's `noul`, P(rule holds), not 0/1.
 - **"Missed" is relative**: the largest residuals within a class, so the NO
   side is shown even on imbalanced data where no row gets P(YES) > 0.5.
@@ -116,20 +118,21 @@ Reload a saved model with `PolicyInduction.load("runs/my_run")`.
 |---|---|---|
 | `task_description` | required | What is predicted and what YES/NO mean. The input that most shapes the rules |
 | `gen_model` | `gpt-5.6` | Rule-writing LLM (`gpt-*`, `deepseek-*`, `gemini-*`, or any `RuleGenerator`) |
-| `max_policy_length` | 100 | Size cap of the rule pool (<= 100); boosting stops when it is full. The pool grows by up to 10 rules per round |
+| `max_policy_length` | 100 | Cap on accepted rules (<= 100); boosting usually stops earlier |
 | `gen_temperature` | 1.0 | Sampling temperature of the rule-writing LLM |
 | `random_state` | 0 | P/V split, example selection and CV folds. **Does not control the LLM** |
 | `weight_config` | `WeightConfig()` | `beta` (threshold only), `Cs`, `cv_folds`, `cv_repeats`, `one_se_rule`, `class_weight_balanced` |
 
 `BoostConfig` holds the internal boosting constants (show-pool share, rules per
-round, filter thresholds, `rel_epsilon`, `patience`). They rarely need changing.
+round, filter thresholds, `accept_z`, `rel_epsilon`, `patience`). They rarely need
+changing.
 
 ## Outputs
 
 `save()` writes to `save_path`:
 
-- `model.json`: rule pool, rules with non-zero weight, threshold, pinned Jev
-  version, metrics, per-round log
+- `model.json`: accepted and rejected rules, rules with non-zero weight,
+  threshold, pinned Jev version, metrics, per-round log
 - `models.joblib`: the 15 fold models (predictions average them)
 - `report.md`: readable report with rules ranked by weight, validation metrics
   and the boosting log
@@ -189,9 +192,9 @@ uv run pytest -q
 ```
 
 Fully offline: a fake generator and fake Jev on synthetic data check that
-boosting finds all signal rules, that V rows never appear in a prompt, both
-stopping conditions, that even rounds show missed NO rows, expand-only
-checkpoint resume, save/load, retry behaviour, request throttling and the
+boosting finds all signal rules while rejecting noise rules, that rejected
+rules are shown to the LLM, that V rows never appear in a prompt, both
+stopping conditions, that even rounds show missed NO rows, checkpoint resume, save/load, retry behaviour, request throttling and the
 OpenAI/DeepSeek fallbacks.
 
 ## Layout

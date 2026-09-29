@@ -67,20 +67,31 @@ async def test_checkpoint_resume(tmp_path, monkeypatch):
         await failing.fit(X, y)
     ckpt = json.loads((tmp_path / "run" / "checkpoint.json").read_text())
     assert ckpt["next_round"] == 2  # rounds 0 and 1 finished
-    pool_before = ckpt["pool"]
+    accepted_before = ckpt["accepted"]
 
     resumed = make_model(tmp_path, boost_config=no_early_stop)
     await resumed.fit(X, y)
     assert resumed.history[0]["round"] == 0 and resumed.history[2]["round"] == 2
-    assert resumed.pool[: len(pool_before)] == pool_before  # expand-only
+    assert resumed.accepted[: len(accepted_before)] == accepted_before  # never removed
     assert not (tmp_path / "run" / "checkpoint.json").exists()
 
 
-async def test_stops_at_pool_cap(tmp_path):
+async def test_stops_at_max_policy_length(tmp_path):
     X, y = make_data()
-    model = await make_model(tmp_path, max_policy_length=5, boost_config=BoostConfig(rel_epsilon=0.0)).fit(X, y)
-    assert len(model.pool) == 5
+    model = await make_model(tmp_path, max_policy_length=2, boost_config=BoostConfig(rel_epsilon=0.0)).fit(X, y)
+    assert len(model.accepted) == 2
     assert model.metrics["stop_reason"] == "max_policy_length"
+
+
+async def test_noise_rules_are_rejected_but_shown_to_llm(tmp_path):
+    X, y = make_data()
+    gen = FakeGenerator()
+    model = await make_model(tmp_path, gen=gen).fit(X, y)
+    # The seed offers "alpha" plus nine noise words; only signal words get in.
+    assert all(r.split()[-1] in {"alpha", "beta", "gamma"} for r in model.accepted)
+    assert any(r.split()[-1].startswith("w") for r in model.rejected)
+    later = " ".join(gen.prompts[1:])
+    assert "ALREADY TRIED, DID NOT HELP" in later and model.rejected[0] in later
 
 
 async def test_stops_when_relative_gain_below_epsilon(tmp_path):

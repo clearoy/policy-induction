@@ -58,9 +58,9 @@ TASK:
 
 SAMPLE FIELDS: {fields}
 
-Every rule in the model's pool is listed below with its weight (positive
-pushes towards YES, negative towards NO) and how often it holds. A weight near
-0 means the rule adds nothing on top of the others.
+The current model uses the rules below. For each rule: its weight (positive
+pushes towards YES, negative towards NO) and how often it holds. Rules already
+tried without improving the model are listed after them.
 
 CURRENT RULES:
 {rules_block}
@@ -76,5 +76,5 @@ probability of being {label}. Next to them are {label} samples it gets RIGHT.
 
 Propose {n} NEW rules that separate the missed samples from the correctly
 handled ones, capturing signals the current rules do not already express.
-Do not restate or reword any listed rule, including those with weight 0.
+Do not restate or reword any listed rule, including those already tried.
 """

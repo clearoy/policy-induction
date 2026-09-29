@@ -63,9 +63,12 @@ class BoostConfig:
         max_rounds: Hard cap on boosting rounds (after the seed round).
         rel_epsilon: A round counts as stalled when it lowers validation
             log-loss by less than this fraction of its current value
-            (0.003 = 0.3%). Relative, so the same value works whatever the
-            class balance.
+            (0.001 = 0.1%). Relative, so the same value works whatever the
+            class balance. A round that accepts no rule improves by 0.
         patience: Stop after this many consecutive stalled rounds.
+        accept_z: A rule is accepted only if the mean per-row log-loss
+            improvement on V exceeds this many standard errors (paired, same
+            folds and C as the round's baseline).
         fire_rate_range: Keep a rule only if its mean probability on V lies in
             this range; outside it the rule is nearly constant.
         max_redundancy: Reject a rule whose correlation with any pooled rule
@@ -77,14 +80,15 @@ class BoostConfig:
             P-side residual correlation is at least this large.
     """
 
-    show_fraction: float = 0.3
+    show_fraction: float = 0.2
     seed_examples_per_class: int = 20
     hard_examples: int = 20
     contrast_examples: int = 20
     rules_per_round: int = 10
     max_rounds: int = 15
-    rel_epsilon: float = 0.003
+    rel_epsilon: float = 0.001
     patience: int = 2
+    accept_z: float = 1.0
     fire_rate_range: Tuple[float, float] = (0.03, 0.97)
     max_redundancy: float = 0.8
     generality_ratio: float = 0.3

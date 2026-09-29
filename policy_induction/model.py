@@ -2,26 +2,24 @@
 
 An interpretable binary classifier. An LLM writes natural-language rules, Jev
 scores P(rule true) for every sample, and an L1 logistic regression weights
-the rules.
+the rules. Each round:
 
-Rules live in a single, expand-only pool. Each round:
+    1. fit L1 logistic regression on the accepted rules; out-of-fold P(YES)
+       for every row
+    2. residual g = y - p; take the show-pool (P) rows the model gets most
+       wrong -- missed YES rows on odd rounds, missed NO rows on even rounds --
+       plus correctly handled rows of the same class as contrast
+    3. the LLM sees those rows, the accepted rules (with weights) and the rules
+       already tried without success, and proposes new rules; Jev scores them
+    4. cheap filters drop near-constant rules, near-duplicates of accepted
+       rules, and rules that fit P but not V (memorised the rows they saw)
+    5. each surviving rule is tried on its own: it is accepted only if it
+       lowers out-of-fold log-loss on the validation pool V -- rows the LLM
+       never sees -- by more than ``accept_z`` standard errors
 
-    1. fit L1 logistic regression on the pool; out-of-fold P(YES) for every row
-    2. residual g = y - p; take the show-pool (P) rows the model gets most wrong
-       -- missed YES rows on odd rounds, missed NO rows on even rounds -- plus
-       correctly handled rows of the same class as contrast
-    3. the LLM sees the whole pool (with weights) and those rows, and proposes
-       new rules; Jev scores them on every row
-    4. a new rule enters the pool unless it is near-constant, a near-duplicate
-       of a pooled rule, or fits P but not V (it memorised the rows it saw)
-    5. refit on the grown pool and measure out-of-fold log-loss on the
-       validation pool V, rows the LLM never sees
-
-Stop when the pool reaches ``max_policy_length`` or ``BoostConfig.patience``
-consecutive rounds each improve V log-loss by less than
-``BoostConfig.rel_epsilon`` (relative). Nothing is ever
-removed from the pool: L1 decides which rules carry weight, and only rules
-with non-zero weight are asked at prediction time.
+Stop when ``max_policy_length`` rules are accepted or ``patience`` consecutive
+rounds each lower V log-loss by less than ``rel_epsilon`` (relative). Accepted
+rules are never removed; L1 shrinks any that later rules make redundant.
 """
 
 from __future__ import annotations
@@ -49,6 +47,7 @@ from .weights import (
     choose_threshold,
     corr,
     make_folds,
+    mean_se,
     oof_proba,
     row_log_loss,
     select_C,
@@ -59,11 +58,13 @@ logger = logging.getLogger(__name__)
 # Long free-text fields are cut when shown to the generation LLM, to keep
 # prompts bounded. Jev always scores the full sample.
 MAX_FIELD_CHARS_IN_PROMPT = 1500
+# Most recent unsuccessful rules listed in the prompt, to bound its length.
+MAX_REJECTED_IN_PROMPT = 60
 
 _CHECKPOINT = "checkpoint.json"
 # Bumped whenever the checkpoint layout changes, so an old checkpoint is
 # ignored rather than misread. The Jev answer cache is unaffected.
-_CHECKPOINT_FORMAT = 3
+_CHECKPOINT_FORMAT = 4
 
 
 class _Eval(NamedTuple):
@@ -81,11 +82,9 @@ class PolicyInduction:
             is the one input that most shapes the rules; be concrete.
         gen_model: Generation LLM name (``gpt-*``, ``deepseek-*``, ``gemini-*``)
             or any object implementing ``RuleGenerator``.
-        max_policy_length: Size cap of the rule pool (<= 100). Boosting stops
-            when the pool is full. Every admitted rule stays in the pool, so
-            the pool grows by up to ``rules_per_round`` per round; the final
-            model uses only the rules L1 gives a non-zero weight, usually far
-            fewer.
+        max_policy_length: Cap on accepted rules (<= 100). Boosting stops
+            when it is reached; usually it stops earlier, when rounds stop
+            finding rules that help.
         gen_temperature: Sampling temperature of the generation LLM.
         random_state: Seeds the P/V split, example selection and CV folds.
             It does not make the generation LLM deterministic.
@@ -134,9 +133,10 @@ class PolicyInduction:
 
         # Learned state
         self.fields: List[str] = []
-        self.pool: List[str] = []  # admitted rules, expand-only
+        self.accepted: List[str] = []  # rules in the model, in acceptance order
+        self.rejected: List[str] = []  # scored but not accepted; shown to the LLM
         self.tried: List[str] = []  # every rule ever proposed (for de-duplication)
-        self.rules: List[str] = []  # pooled rules with non-zero final weight
+        self.rules: List[str] = []  # accepted rules with non-zero final weight
         self.history: List[Dict[str, Any]] = []
         self.threshold: float | None = None
         self.metrics: Dict[str, Any] = {}
@@ -148,7 +148,7 @@ class PolicyInduction:
     # ── Public API ─────────────────────────────────────────────────────────
 
     async def fit(self, X: pd.DataFrame, y: Sequence[Any]) -> "PolicyInduction":
-        """Grow the rule pool by boosting, then fit the final weighted model."""
+        """Find rules by boosting, then fit the final weighted model."""
         states = _to_states(X)
         y01 = _to_binary(y)
         if len(states) != len(y01):
@@ -168,29 +168,30 @@ class PolicyInduction:
         ckpt = self._read_checkpoint(fingerprint)
         start_round, stale = 0, 0
         if ckpt:
-            self.pool, self.tried, self.history = ckpt["pool"], ckpt["tried"], ckpt["history"]
+            self.accepted, self.rejected = ckpt["accepted"], ckpt["rejected"]
+            self.tried, self.history = ckpt["tried"], ckpt["history"]
             start_round, stale = ckpt["next_round"], ckpt["stale"]
-            logger.info("Resuming at round %d with %d pooled rules.", start_round, len(self.pool))
+            logger.info("Resuming at round %d with %d accepted rules.", start_round, len(self.accepted))
 
         cols: Dict[str, np.ndarray] = {}
-        if self.pool:
-            cols.update(await self._score(scorer, states, self.pool))  # cache hits
+        if self.accepted:
+            cols.update(await self._score(scorer, states, self.accepted))  # cache hits
 
         stop_reason = "max_rounds"
         for rnd in range(start_round, bc.max_rounds + 1):
-            if len(self.pool) >= self.max_policy_length:
+            if len(self.accepted) >= self.max_policy_length:
                 stop_reason = "max_policy_length"
                 break
 
-            # One fold assignment per round, shared by the before/after comparison.
+            # One fold assignment per round, shared by every comparison in it.
             folds = make_folds(
                 y01, in_p, self.weight_config.cv_folds, self.weight_config.cv_repeats,
                 self.random_state * 1000 + rnd,
             )
-            before = self._evaluate(cols, self.pool, y01, folds, in_v)
+            before = self._evaluate(cols, self.accepted, y01, folds, in_v)
             g = y01 - before.p
 
-            if not self.pool:
+            if rnd == 0 and not self.accepted:
                 prompt, direction = self._seed_prompt(states, y01, in_p, rng), "seed"
             else:
                 prompt, direction = self._boost_prompt(
@@ -203,30 +204,44 @@ class PolicyInduction:
             log: Dict[str, Any] = {
                 "round": rnd, "direction": direction, "C": before.C,
                 "val_log_loss_before": before.val_loss,
-                "proposed": len(proposed), "rejected": {}, "added": [],
+                "proposed": len(proposed), "rejected": {}, "accepted": [],
             }
 
+            base_loss = row_log_loss(y01[in_v], before.p[in_v])
             if candidates:
                 cols.update(await self._score(scorer, states, candidates))
-                admitted = self._filter(candidates, cols, g, in_p, in_v, log)
-                admitted.sort(key=lambda r: -abs(corr(cols[r][in_v], g[in_v])))
-                room = self.max_policy_length - len(self.pool)
-                if len(admitted) > room:
-                    log["rejected"]["pool_full"] = len(admitted) - room
-                    admitted = admitted[:room]
-                self.pool.extend(admitted)
-                log["added"] = admitted
+                survivors = self._filter(candidates, cols, g, in_p, in_v, log)
 
-            after = self._evaluate(cols, self.pool, y01, folds, in_v) if log["added"] else before
-            rel = (before.val_loss - after.val_loss) / before.val_loss
-            log.update(val_log_loss_after=after.val_loss, relative_improvement=rel,
-                       pool_size=len(self.pool))
+                # Try each rule on its own, strongest V-side residual signal first,
+                # with the round's C and folds so every comparison is paired.
+                survivors.sort(key=lambda r: -abs(corr(cols[r][in_v], g[in_v])))
+                for rule in survivors:
+                    if len(self.accepted) >= self.max_policy_length:
+                        break
+                    X_try = _matrix(cols, self.accepted + [rule], len(y01))
+                    p_try, _ = oof_proba(X_try, y01, folds, before.C, self.weight_config)
+                    try_loss = row_log_loss(y01[in_v], p_try[in_v])
+                    gain, se = mean_se(base_loss - try_loss)
+                    if gain > 0 and gain > bc.accept_z * se:
+                        self.accepted.append(rule)
+                        base_loss = try_loss
+                        log["accepted"].append({"rule": rule, "gain": gain, "se": se})
+                    else:
+                        log["rejected"]["no_gain"] = log["rejected"].get("no_gain", 0) + 1
+                taken = {a["rule"] for a in log["accepted"]}
+                self.rejected.extend(r for r in candidates if r not in taken)
+
+            after_loss = float(base_loss.mean())
+            rel = (before.val_loss - after_loss) / before.val_loss
+            log.update(val_log_loss_after=after_loss, relative_improvement=rel,
+                       n_accepted=len(self.accepted))
             self.history.append(log)
             logger.info(
-                "Round %d (%s): +%d rules -> pool %d, V log-loss %.4f -> %.4f (%+.2f%%)",
-                rnd, direction, len(log["added"]), len(self.pool),
-                before.val_loss, after.val_loss, 100 * rel,
+                "Round %d (%s): +%d rules -> %d, V log-loss %.4f -> %.4f (%+.2f%%)",
+                rnd, direction, len(log["accepted"]), len(self.accepted),
+                before.val_loss, after_loss, 100 * rel,
             )
+
             # One weak round (an unlucky LLM batch) is not enough to stop.
             stale = stale + 1 if rel < bc.rel_epsilon else 0
             self._write_checkpoint(fingerprint, rnd + 1, stale)
@@ -234,10 +249,10 @@ class PolicyInduction:
                 stop_reason = "converged"
                 break
 
-        if not self.pool:
+        if not self.accepted:
             raise RuntimeError(
-                "No usable rule was produced. Check the task description, the data, "
-                "or try a stronger generation model."
+                "No rule improved validation log-loss. Check the task description, "
+                "the data, or try a stronger generation model."
             )
 
         self._fit_final(cols, y01, in_p, in_v)
@@ -333,14 +348,24 @@ class PolicyInduction:
         return prompt, f"missed_{label}"
 
     def _rules_block(self, cols, fold_models) -> str:
-        w = np.mean([m.coef_[0] for m in fold_models], axis=0)
-        return "\n".join(
-            f"- [weight {w[i]:+.2f}, holds {cols[r].mean():.0%}] {r}"
-            for i, r in enumerate(self.pool)
-        )
+        """Accepted rules with weights, then recent rules that did not help."""
+        lines = []
+        if self.accepted:
+            w = np.mean([m.coef_[0] for m in fold_models], axis=0)
+            lines += [
+                f"- [weight {w[i]:+.2f}, holds {cols[r].mean():.0%}] {r}"
+                for i, r in enumerate(self.accepted)
+            ]
+        else:
+            lines.append("(none accepted yet)")
+        recent = self.rejected[-MAX_REJECTED_IN_PROMPT:]
+        if recent:
+            lines += ["", "ALREADY TRIED, DID NOT HELP (do not propose these again):"]
+            lines += [f"- {r}" for r in recent]
+        return "\n".join(lines)
 
     def _filter(self, candidates, cols, g, in_p, in_v, log) -> List[str]:
-        """Admission checks, no refitting: fire rate, redundancy, generality."""
+        """Cheap checks before any refitting: fire rate, redundancy, generality."""
         bc = self.boost_config
         lo, hi = bc.fire_rate_range
         kept: List[str] = []
@@ -353,7 +378,7 @@ class PolicyInduction:
             if not lo <= f[in_v].mean() <= hi:
                 reject("constant")
                 continue
-            if any(abs(corr(f, cols[o])) > bc.max_redundancy for o in self.pool + kept):
+            if any(abs(corr(f, cols[o])) > bc.max_redundancy for o in self.accepted + kept):
                 reject("redundant")
                 continue
             c_p, c_v = corr(f[in_p], g[in_p]), corr(f[in_v], g[in_v])
@@ -370,7 +395,7 @@ class PolicyInduction:
     def _fit_final(self, cols, y01, in_p, in_v) -> None:
         wc, bc = self.weight_config, self.boost_config
         folds = make_folds(y01, in_p, wc.cv_folds, wc.cv_repeats, self.random_state * 1000 + 999_983)
-        rules = list(self.pool)
+        rules = list(self.accepted)
         X = _matrix(cols, rules, len(y01))
         sel = select_C(X, y01, folds, in_v, wc, one_se=wc.one_se_rule)
         p, models = oof_proba(X, y01, folds, sel.C, wc)
@@ -401,7 +426,7 @@ class PolicyInduction:
             "val_accuracy": float((pred == yv).mean()),
             "threshold": t,
             "n_rules": len(rules),
-            "n_pool": len(self.pool),
+            "n_accepted": len(self.accepted),
             "n_tried": len(self.tried),
             "n_train": int(len(y01)),
             "n_show_pool": int(in_p.sum()),
@@ -462,7 +487,8 @@ class PolicyInduction:
         tmp = self.save_path / (_CHECKPOINT + ".tmp")
         tmp.write_text(json.dumps({
             "format": _CHECKPOINT_FORMAT, "fingerprint": fingerprint,
-            "next_round": next_round, "stale": stale, "pool": self.pool, "tried": self.tried,
+            "next_round": next_round, "stale": stale, "accepted": self.accepted,
+            "rejected": self.rejected, "tried": self.tried,
             "history": self.history,
         }))
         tmp.replace(self.save_path / _CHECKPOINT)
@@ -478,7 +504,7 @@ class PolicyInduction:
         base = Path(path) if path else self.save_path
         base.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "version": 2,
+            "version": 3,
             "task_description": self.task_description,
             "gen_model": self.gen_model_name,
             "max_policy_length": self.max_policy_length,
@@ -489,7 +515,8 @@ class PolicyInduction:
             "jev_version": self.jev_version,
             "fields": self.fields,
             "rules": self.rules,
-            "pool": self.pool,
+            "accepted": self.accepted,
+            "rejected": self.rejected,
             "tried": self.tried,
             "threshold": self.threshold,
             "feature_means": self._feature_means.tolist(),  # type: ignore[union-attr]
@@ -528,8 +555,11 @@ class PolicyInduction:
             save_path=base,
         )
         inst.jev_version = m["jev_version"]
-        inst.fields, inst.rules, inst.pool = m["fields"], m["rules"], m["pool"]
-        inst.tried = m.get("tried", list(m["pool"]))
+        inst.fields, inst.rules = m["fields"], m["rules"]
+        # Older manifests called the accepted set "pool".
+        inst.accepted = m.get("accepted", m.get("pool", list(m["rules"])))
+        inst.rejected = m.get("rejected", [])
+        inst.tried = m.get("tried", list(inst.accepted))
         inst.threshold, inst._C = m["threshold"], m["C"]
         inst._feature_means = np.array(m["feature_means"])
         inst.metrics, inst.history = m["metrics"], m["history"]
@@ -544,8 +574,8 @@ class PolicyInduction:
             "# PolicyInduction report", "",
             f"- Fitted: {m.get('fitted_at', '?')}",
             f"- Generation model: `{self.gen_model_name}` · Jev: `{self.jev_version}`",
-            f"- Rules: {m['n_rules']} with non-zero weight / {m['n_pool']} in pool / "
-            f"{m['n_tried']} proposed (pool cap {self.max_policy_length}, "
+            f"- Rules: {m['n_rules']} with non-zero weight / {m['n_accepted']} accepted / "
+            f"{m['n_tried']} proposed (cap {self.max_policy_length}, "
             f"stopped: {m.get('stop_reason')})",
             f"- Rows: {m['n_train']} (show pool {m['n_show_pool']}, validation pool {m['n_val_pool']})",
             "",
@@ -565,17 +595,17 @@ class PolicyInduction:
                 f"| {i + 1} | {row['weight']:+.3f} | {row['weight_sd']:.3f} "
                 f"| {row['holds_mean']:.0%} | {rule} |"
             )
-        unused = [r for r in self.pool if r not in set(self.rules)]
+        unused = [r for r in self.accepted if r not in set(self.rules)]
         if unused:
-            lines += ["", f"## Pooled rules with zero weight ({len(unused)})", ""]
+            lines += ["", f"## Accepted rules that ended with zero weight ({len(unused)})", ""]
             lines += [f"- {r}" for r in unused]
         lines += ["", "## Boosting rounds", "",
-                  "| round | focus | proposed | added | rejected | V log-loss | change |",
+                  "| round | focus | proposed | accepted | rejected | V log-loss | change |",
                   "|---|---|---|---|---|---|---|"]
         for h in self.history:
             rej = ", ".join(f"{k} {v}" for k, v in h["rejected"].items()) or "-"
             lines.append(
-                f"| {h['round']} | {h['direction']} | {h['proposed']} | {len(h['added'])} "
+                f"| {h['round']} | {h['direction']} | {h['proposed']} | {len(h['accepted'])} "
                 f"| {rej} | {h['val_log_loss_before']:.4f} → {h['val_log_loss_after']:.4f} "
                 f"| {-100 * h['relative_improvement']:+.2f}% |"
             )
