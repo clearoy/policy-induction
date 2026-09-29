@@ -1,32 +1,50 @@
-# PolicyInduction（Boosting 版）
+# PolicyInduction (boosted)
 
-可解释的二分类器：LLM 写自然语言规则，[TypeSafe Jev](https://docs.typesafe.ai) 给每个样本打"规则成立的概率"，L1 逻辑回归学习每条规则的权重。规则通过 **boosting** 逐轮发现：每一轮都针对当前模型判错的样本写新规则，并且只保留在 LLM 从未见过的数据上确实降低误差的规则。
+An interpretable binary classifier. An LLM writes natural-language rules,
+[TypeSafe Jev](https://docs.typesafe.ai) scores the probability that each rule
+holds for each sample, and an L1 logistic regression learns a weight per rule.
 
-## 原理
+Rules are found by **boosting**: every round targets the samples the current
+model gets wrong, and a new rule is kept only if it lowers the error on data the
+LLM has never seen.
+
+## How it works
 
 ```
-训练集 ──┬── P 展示池（30%）：LLM 只能看到这里的样本和标签
-         └── V 验证池（70%）：LLM 永远看不到；所有决策只依据这里
+training data ──┬── P, show pool (30%):  the only rows whose labels the LLM sees
+                └── V, validation pool (70%): never shown; every score is measured here
 
-第 0 轮：从 P 抽 YES/NO 各 20 条 → LLM 写种子规则
-第 1…R 轮：
-  1. 在当前规则上做交叉验证 → 每个样本的 out-of-fold P(YES)
-  2. 残差 g = y − p（只用 P 的样本挑错例）
-  3. 奇数轮给 LLM 看漏判的 YES，偶数轮看误判的 NO，每次都附带判对的同类样本作对照
-  4. LLM 提出新规则 → Jev 在全部样本上打分
-  5. 过滤：常数规则、与已有规则高度相关、只在 P 上有效（在 V 上无效）
-  6. 逐条尝试：只有当 V 上逐样本 log-loss 的平均改进 > 1 个标准误时才接受
-  7. 连续 2 轮没有新规则被接受，或规则数达到上限时停止
-收尾：按一倍标准误规则选 C → 在拼起来的 V out-of-fold 概率上选阈值
-预测：15 个折模型的平均概率 ≥ 阈值 → YES
+one rule pool, expand-only
+
+round 0     sample 20 YES + 20 NO rows from P -> the LLM writes seed rules
+round 1..R
+  1. fit L1 logistic regression on the pool -> out-of-fold P(YES) for every row
+  2. residual g = y - p; take the P rows of one class the model gets most wrong:
+     missed YES rows on odd rounds, missed NO rows on even rounds, plus
+     correctly handled rows of the same class as contrast
+  3. the LLM sees the whole pool (with weights) and those rows, and proposes
+     new rules -> Jev scores them on every row
+  4. a new rule joins the pool unless it is near-constant, a near-duplicate of
+     a pooled rule, or fits P but not V
+  5. refit on the grown pool; measure out-of-fold log-loss on V
+stop        the pool reaches max_policy_length, or a round lowers V log-loss by
+            less than rel_epsilon (0.3%, relative)
+finish      choose C by the one-standard-error rule, then the decision threshold
+            on V's pooled out-of-fold probabilities
+predict     ask Jev only the rules with non-zero weight; mean P(YES) of the 15
+            fold models >= threshold -> YES
 ```
 
-- **规则只加不删**：被后来的规则取代的旧规则，由 L1 把权重压到 0。
-- **特征是概率**：Jev 的 `noul`（P(规则成立)），不做二值化。
-- **规则数上限** = `min(max_policy_length, 少数类样本数 / 10)`。
-- **Jev 版本锁定**：第一次请求时确定具体版本（如 `jev-1.13.0`），写进模型文件，预测时强制使用同一版本。
+- **Expand-only.** Nothing leaves the pool; L1 decides which rules carry
+  weight, so a rule that looked useless early can gain weight later.
+- **Features are probabilities**: Jev's `noul`, P(rule holds), not 0/1.
+- **"Missed" is relative**: the largest residuals within a class, so the NO
+  side is shown even on imbalanced data where no row gets P(YES) > 0.5.
+- **Jev version is pinned.** The concrete version answering the first request
+  (e.g. `jev-1.13.0`) is saved with the model and used for all later
+  predictions, so features never drift under the trained weights.
 
-## 安装
+## Install
 
 ```bash
 cd policy-induction
@@ -34,19 +52,26 @@ uv venv --python 3.13 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 ```
 
-以可编辑模式安装后，`experiments/` 下的脚本可以直接 `import policy_induction`。只需要运行时依赖的话，也可以用 `requirements.txt`。
+`requirements.txt` lists the runtime dependencies for a non-editable install.
 
-## 配置 `.env`
+> **macOS note.** macOS may set the "hidden" flag on the editable-install `.pth`
+> file, and Python 3.13 skips hidden `.pth` files, which makes `import
+> policy_induction` fail. Fix it with
+> `chflags nohidden .venv/lib/python3.13/site-packages/*.pth`. The experiment
+> scripts add the repo root to `sys.path`, so they work either way.
 
-| 变量 | 用途 |
+## Configure `.env`
+
+Copy `.env.example` to `.env` and fill it in. `.env` is gitignored.
+
+| Variable | Needed for |
 |---|---|
-| `TYPESAFE_API_KEY` | **必需**，Jev 打分。在 <https://console.typesafe.ai/keys> 创建 |
-| `GOOGLE_AI_API_KEY` | 使用 `gemini-*` 生成规则时需要 |
-| `OPENAI_API_KEY` | 使用 `gpt-*` 生成规则时需要 |
+| `TYPESAFE_API_KEY` | **Required.** Jev scoring. Create a key at <https://console.typesafe.ai/keys> |
+| `DEEPSEEK_API_KEY` | Generating rules with a `deepseek-*` model (used by the VCBench script) |
+| `OPENAI_API_KEY` | Generating rules with a `gpt-*` model (the library default) |
+| `GOOGLE_AI_API_KEY` | Generating rules with a `gemini-*` model |
 
-复制 `.env.example` 为 `.env` 并填写。`.env` 已加入 `.gitignore`，不会被提交。
-
-## 使用
+## Usage
 
 ```python
 import asyncio
@@ -57,14 +82,14 @@ load_dotenv()
 
 async def main():
     model = PolicyInduction(
-        task_description="Predict whether reply A changed the original poster's view. YES = A won.",
-        gen_model="gemini-3.5-flash",
+        task_description="Predict whether ... YES means ..., NO means ...",
+        gen_model="gpt-5.6",
         max_policy_length=30,
         weight_config=WeightConfig(beta=0.5),
-        save_path="runs/cmv",
+        save_path="runs/my_run",
     )
-    await model.fit(X_train, y_train)          # y: "YES"/"NO" 或 1/0
-    print(model.rule_table())                  # 规则、权重、成立比例
+    await model.fit(X_train, y_train)          # y: "YES"/"NO" or 1/0
+    print(model.rule_table())                  # rule, weight, how often it holds
     labels = await model.predict(X_test)       # ["YES", "NO", ...]
     probs = await model.predict_proba(X_test)
     model.save()                               # model.json, models.joblib, report.md
@@ -73,68 +98,104 @@ async def main():
 asyncio.run(main())
 ```
 
-加载已保存的模型：`PolicyInduction.load("runs/cmv")`。
+Reload a saved model with `PolicyInduction.load("runs/my_run")`.
 
-## 参数
+## Parameters
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `task_description` | 必填 | 预测什么、YES/NO 的含义。对规则质量影响最大 |
-| `gen_model` | `gemini-3.5-flash` | 生成规则的 LLM（`gemini-*` / `gpt-*`，或自定义 `RuleGenerator`） |
-| `max_policy_length` | 30 | 规则数上限（≤100），还会受数据量限制 |
-| `gen_temperature` | 1.0 | 生成时的随机性 |
-| `random_state` | 0 | P/V 划分、样本抽取、交叉验证折。**不控制 LLM** |
-| `weight_config` | `WeightConfig()` | `beta`（只用于选阈值）、`Cs`、`cv_folds`、`cv_repeats`、`one_se_rule`、`class_weight_balanced` |
+| `task_description` | required | What is predicted and what YES/NO mean. The input that most shapes the rules |
+| `gen_model` | `gpt-5.6` | Rule-writing LLM (`gpt-*`, `deepseek-*`, `gemini-*`, or any `RuleGenerator`) |
+| `max_policy_length` | 30 | Size cap of the rule pool (<= 100); boosting stops when it is full |
+| `gen_temperature` | 1.0 | Sampling temperature of the rule-writing LLM |
+| `random_state` | 0 | P/V split, example selection and CV folds. **Does not control the LLM** |
+| `weight_config` | `WeightConfig()` | `beta` (threshold only), `Cs`, `cv_folds`, `cv_repeats`, `one_se_rule`, `class_weight_balanced` |
 
-`BoostConfig` 存放 boosting 的内部常数（P 占比、每轮规则数、过滤阈值、早停等），一般不需要改。
+`BoostConfig` holds the internal boosting constants (show-pool share, rules per
+round, filter thresholds, `rel_epsilon`). They rarely need changing.
 
-## 输出
+## Outputs
 
-`save()` 会在 `save_path` 下写出：
+`save()` writes to `save_path`:
 
-- `model.json`：规则、阈值、锁定的 Jev 版本、指标、每轮日志
-- `models.joblib`：15 个折模型（预测时取平均）
-- `report.md`：可读报告，包括规则按权重排序、验证指标、每轮 boosting 的记录
-- `jev_cache.sqlite`：Jev 答案缓存（按 版本 + 样本 + 规则 缓存），中断后重跑只补缺失部分
-- `checkpoint.json`：训练中途的状态，训练完成后自动删除
+- `model.json`: rule pool, rules with non-zero weight, threshold, pinned Jev
+  version, metrics, per-round log
+- `models.joblib`: the 15 fold models (predictions average them)
+- `report.md`: readable report with rules ranked by weight, validation metrics
+  and the boosting log
+- `jev_cache.sqlite`: cached Jev answers keyed by version + sample + rule; a
+  re-run only requests what is missing
+- `checkpoint.json`: mid-training state, deleted when training completes
 
-报告里的指标都是 **V 上的 out-of-fold 结果**，也就是在生成规则的 LLM 没见过的样本上的表现。
+All reported validation metrics are **out-of-fold on V**, i.e. measured on rows
+the rule-writing LLM never saw.
 
-## 规则的写法
+## Experiments
 
-Jev 按字面意思逐条判断规则，并且不擅长数值计算、多个条件和多步推理。生成 prompt 因此要求每条规则：
+### VCBench
 
-- 只描述一个可观察的条件（不能用"且/或"组合）
-- 只描述条件，不写结论（方向由权重决定）
-- 用反引号引用字段名，例如 `` `argument_A` ``
-- 不引用样本原句，不出现具体人名、公司名、数字
+Founder success prediction (4,500 public / 4,500 private founders, 9.0%
+positive). Put `vcbench_final_public.csv` and `vcbench_final_private.csv` in
+`experiments/vcbench/data/` (gitignored), then from the repo root:
 
-## 已知限制
+```bash
+.venv/bin/python experiments/vcbench/run_vcbench.py
+```
 
-- **数值型数据**：Jev 不擅长数值比较。以数值列为主的表格数据（如 COMPAS），效果可能不如直接用逻辑回归。
-- **成对比较任务**（如 CMV 的 A vs B）：目前按普通样本处理。反对称特征（f(A) − f(B)）尚未实现。
-- **数据量**：V 需要足够大，接受检验才有统计效力。只有几百行时，规则上限会被自动压低。
-- **生成仍有随机性**：比较不同配置时至少跑 3 个 `random_state`。
+It trains on all public rows (anonymised profile text, as in the earlier
+think-reason-learn runs) and evaluates on all private rows, writing rules with
+`deepseek-chat`. Settings such as the generation model live as constants at the top of the script. Re-running
+resumes an interrupted run; `--name` keeps separate runs apart.
 
-## 测试
+Results go to `experiments/vcbench/runs/<name>/` (gitignored): `report.md`,
+`model.json`, `predictions.csv`, `metrics.json` (validation and test metrics,
+Jev cost, git commit) and `run.log`.
+
+## How rules are written
+
+Jev judges each rule literally and one at a time, and is weak at arithmetic,
+compound conditions and multi-step reasoning. The generation prompt therefore
+requires every rule to:
+
+- describe exactly one observable condition (no "and"/"or")
+- state a condition, not a verdict (the weight decides the direction)
+- name fields in backticks, e.g. `` `profile` ``
+- avoid quoting samples or naming specific people, companies or numbers
+
+## Known limitations
+
+- **Numeric-heavy data**: Jev is weak at numeric comparisons; on mostly numeric
+  tables a plain logistic regression may do better.
+- **Pairwise tasks** (A vs B): treated as ordinary samples. Antisymmetric
+  features (f(A) - f(B)) are not implemented yet.
+- **Data size**: V must be large enough for its log-loss to be a stable
+  signal; with a few hundred rows, round-to-round changes are mostly noise.
+- **Generation is stochastic**: compare configurations over at least 3 seeds.
+
+## Tests
 
 ```bash
 .venv/bin/python -m pytest -q
 ```
 
-测试完全离线：用一个假的生成器和假的 Jev，在合成数据上验证 boosting 能找出全部信号规则、V 的样本从不出现在 prompt 里、断点续跑、保存和加载、规则上限等。
+Fully offline: a fake generator and fake Jev on synthetic data check that
+boosting finds all signal rules, that V rows never appear in a prompt, both
+stopping conditions, that even rounds show missed NO rows, expand-only
+checkpoint resume, save/load, retry behaviour, request throttling and the
+OpenAI/DeepSeek fallbacks.
 
-## 目录
+## Layout
 
 ```
 policy_induction/
-  model.py       PolicyInduction：boosting 循环、最终拟合、预测、保存和加载
-  weights.py     交叉验证、选 C、配对接受检验、阈值
-  scorer.py      Jev 打分、版本锁定、SQLite 缓存
-  generator.py   生成 LLM（Gemini / OpenAI）
-  prompts.py     生成 prompt 和规则写法约束
-  config.py      WeightConfig、BoostConfig
-experiments/     各数据集的实验脚本（data/ 和结果不入库）
+  model.py       PolicyInduction: boosting loop, final fit, predict, save/load
+  weights.py     cross-validation, choosing C, threshold
+  scorer.py      Jev scoring, version pinning, SQLite cache, rate limit
+  generator.py   rule-writing LLMs (OpenAI / DeepSeek / Gemini)
+  prompts.py     generation prompts and rule-writing constraints
+  config.py      WeightConfig, BoostConfig
+experiments/
+  vcbench/run_vcbench.py
 tests/
 pyproject.toml
 ```

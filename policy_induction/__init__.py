@@ -2,7 +2,13 @@
 scored by TypeSafe Jev."""
 
 from .config import BoostConfig, WeightConfig
-from .generator import GoogleGenerator, OpenAIGenerator, RuleGenerator, make_generator
+from .generator import (
+    DeepSeekGenerator,
+    GoogleGenerator,
+    OpenAIGenerator,
+    RuleGenerator,
+    make_generator,
+)
 from .model import PolicyInduction
 from .scorer import JevScorer, Scorer
 
@@ -15,5 +21,6 @@ __all__ = [
     "RuleGenerator",
     "OpenAIGenerator",
     "GoogleGenerator",
+    "DeepSeekGenerator",
     "make_generator",
 ]

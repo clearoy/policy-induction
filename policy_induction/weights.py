@@ -1,4 +1,4 @@
-"""Cross-validation, weight fitting, acceptance tests and threshold selection.
+"""Cross-validation, weight fitting and threshold selection.
 
 Everything here is cheap (no API calls): a logistic regression over a few
 dozen probability features fits in milliseconds, so every decision can afford
@@ -129,11 +129,6 @@ def select_C(
         limit = best[1] + best[2]
         chosen = next(t for t in table if t[1] <= limit)  # smallest C = strongest
     return CSelection(C=chosen[0], val_loss=chosen[1], val_loss_se=chosen[2], table=table)
-
-
-def paired_gain(loss_before: np.ndarray, loss_after: np.ndarray) -> Tuple[float, float]:
-    """Mean and SE of the per-row log-loss improvement (positive = better)."""
-    return mean_se(loss_before - loss_after)
 
 
 def choose_threshold(

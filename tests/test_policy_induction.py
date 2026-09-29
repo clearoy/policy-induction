@@ -61,27 +61,50 @@ async def test_predict_and_save_load_roundtrip(tmp_path):
 async def test_checkpoint_resume(tmp_path, monkeypatch):
     monkeypatch.setattr("policy_induction.model.GEN_RETRIES", 1)
     X, y = make_data()
-    failing = make_model(tmp_path, gen=FakeGenerator(fail_from_call=3))
+    no_early_stop = BoostConfig(rel_epsilon=0.0)
+    failing = make_model(tmp_path, gen=FakeGenerator(fail_from_call=3), boost_config=no_early_stop)
     with pytest.raises(RuntimeError, match="simulated"):
         await failing.fit(X, y)
     ckpt = json.loads((tmp_path / "run" / "checkpoint.json").read_text())
     assert ckpt["next_round"] == 2  # rounds 0 and 1 finished
+    pool_before = ckpt["pool"]
 
-    resumed = make_model(tmp_path)
+    resumed = make_model(tmp_path, boost_config=no_early_stop)
     await resumed.fit(X, y)
     assert resumed.history[0]["round"] == 0 and resumed.history[2]["round"] == 2
+    assert resumed.pool[: len(pool_before)] == pool_before  # expand-only
     assert not (tmp_path / "run" / "checkpoint.json").exists()
 
 
-async def test_rule_cap_follows_data_size(tmp_path):
-    X, y = make_data(n=600)
-    y = list(y)
-    # Keep only 25 positives -> data-driven cap of 2 rules.
-    pos = [i for i, v in enumerate(y) if v == "YES"][25:]
-    keep = [i for i in range(len(y)) if i not in set(pos)]
-    X, y = X.iloc[keep].reset_index(drop=True), [y[i] for i in keep]
-    model = await make_model(tmp_path, max_policy_length=30).fit(X, y)
-    assert model.metrics["rule_cap"] == 2 and len(model.rules) <= 2
+async def test_stops_at_pool_cap(tmp_path):
+    X, y = make_data()
+    model = await make_model(tmp_path, max_policy_length=5, boost_config=BoostConfig(rel_epsilon=0.0)).fit(X, y)
+    assert len(model.pool) == 5
+    assert model.metrics["stop_reason"] == "max_policy_length"
+
+
+async def test_stops_when_relative_gain_below_epsilon(tmp_path):
+    X, y = make_data()
+    # After the seed round this generator only offers noise words, so the
+    # first boosting round cannot lower validation log-loss by 0.3%.
+    class NoiseAfterSeed(FakeGenerator):
+        async def generate(self, system, prompt, temperature):
+            rules = await super().generate(system, prompt, temperature)
+            if len(self.prompts) > 1:
+                return [f"`text` mentions w{i}" for i in range(10, 20)]
+            return rules
+
+    model = await make_model(tmp_path, gen=NoiseAfterSeed()).fit(X, y)
+    assert model.metrics["stop_reason"] == "converged"
+    assert len(model.history) == 2
+    assert model.history[-1]["relative_improvement"] < BoostConfig().rel_epsilon
+
+
+async def test_even_rounds_show_missed_no_rows(tmp_path):
+    X, y = make_data()
+    model = await make_model(tmp_path, boost_config=BoostConfig(rel_epsilon=0.0, max_rounds=4)).fit(X, y)
+    directions = [h["direction"] for h in model.history]
+    assert directions[:5] == ["seed", "missed_YES", "missed_NO", "missed_YES", "missed_NO"]
 
 
 def test_rejects_bad_args(tmp_path):
@@ -153,3 +176,86 @@ async def test_generation_retry_skips_permanent_errors(monkeypatch):
 
 async def _no_sleep(_):
     return None
+
+
+async def test_jev_scorer_throttles_request_rate():
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    from policy_induction import JevScorer
+
+    class FakeClient:
+        async def system_one(self, state, questions, model):
+            answers = {k: SimpleNamespace(noul=0.5) for k in questions}
+            return SimpleNamespace(
+                model="jev-9.9.9", usage=SimpleNamespace(input_tokens=1), answers=answers
+            )
+
+    scorer = JevScorer(model="jev-9.9.9", concurrency=8, max_rpm=600)  # 0.1 s apart
+    scorer._client = FakeClient()
+    start = time.monotonic()
+    await scorer.score([{"t": str(i)} for i in range(6)], ["rule"])
+    assert time.monotonic() - start >= 0.45  # 6 starts need >= 5 intervals
+    assert scorer.requests == 6
+
+
+async def test_openai_generator_drops_temperature_when_rejected():
+    import httpx
+    from openai import BadRequestError
+    from types import SimpleNamespace
+
+    from policy_induction.generator import OpenAIGenerator, Rules
+
+    calls = []
+
+    class FakeResponses:
+        async def parse(self, **kwargs):
+            calls.append("temperature" in kwargs)
+            if "temperature" in kwargs:
+                req = httpx.Request("POST", "https://api.openai.com/v1/responses")
+                raise BadRequestError(
+                    "Unsupported parameter: 'temperature'",
+                    response=httpx.Response(400, request=req),
+                    body=None,
+                )
+            return SimpleNamespace(output_parsed=Rules(rules=["`x` is long"]))
+
+    gen = OpenAIGenerator("gpt-5.6", api_key="test")
+    gen._client = SimpleNamespace(responses=FakeResponses())
+    assert await gen.generate("s", "p", 1.0) == ["`x` is long"]
+    assert await gen.generate("s", "p", 1.0) == ["`x` is long"]
+    assert calls == [True, False, False]  # learned once, then never sent again
+
+
+async def test_deepseek_generator_json_mode_and_fallback(monkeypatch):
+    import httpx
+    from openai import BadRequestError
+    from types import SimpleNamespace
+
+    from policy_induction.generator import DeepSeekGenerator, make_generator
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
+        make_generator("deepseek-chat")
+
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append("response_format" in kwargs)
+            if "response_format" in kwargs:
+                req = httpx.Request("POST", "https://api.deepseek.com/chat/completions")
+                raise BadRequestError(
+                    "response_format is not supported",
+                    response=httpx.Response(400, request=req),
+                    body=None,
+                )
+            text = '```json\n{"rules": ["`x` is long", "`x` is short"]}\n```'
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+    gen = DeepSeekGenerator("deepseek-reasoner", api_key="test")
+    gen._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    assert await gen.generate("s", "p", 1.0) == ["`x` is long", "`x` is short"]
+    assert await gen.generate("s", "p", 1.0) == ["`x` is long", "`x` is short"]
+    assert calls == [True, False, False]

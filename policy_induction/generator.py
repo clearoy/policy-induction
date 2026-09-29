@@ -36,15 +36,24 @@ class OpenAIGenerator:
         self._client = AsyncOpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY"), timeout=REQUEST_TIMEOUT_S
         )
+        # Reasoning models reject `temperature`; learned from the first 400.
+        self._supports_temperature = True
 
     async def generate(self, system: str, prompt: str, temperature: float) -> List[str]:
-        response = await self._client.responses.parse(
-            model=self.model,
-            instructions=system,
-            input=prompt,
-            text_format=Rules,
-            temperature=temperature,
-        )
+        from openai import BadRequestError
+
+        kwargs = dict(model=self.model, instructions=system, input=prompt, text_format=Rules)
+        try:
+            if self._supports_temperature:
+                response = await self._client.responses.parse(**kwargs, temperature=temperature)
+            else:
+                response = await self._client.responses.parse(**kwargs)
+        except BadRequestError as e:
+            if not self._supports_temperature or "temperature" not in str(e).lower():
+                raise
+            logger.info("%s does not accept temperature; using its default.", self.model)
+            self._supports_temperature = False
+            response = await self._client.responses.parse(**kwargs)
         parsed = response.output_parsed
         if parsed is None:
             raise RuntimeError(f"{self.model} returned no parseable rules")
@@ -85,14 +94,75 @@ class GoogleGenerator:
         raise RuntimeError(f"{self.model} returned no parseable rules")
 
 
+class DeepSeekGenerator:
+    """DeepSeek via its OpenAI-compatible chat API.
+
+    DeepSeek has no schema-constrained parsing, only a JSON mode, so the reply
+    is validated against ``Rules`` here. Models that reject JSON mode (e.g.
+    older ``deepseek-reasoner``) fall back to extracting JSON from plain text.
+    """
+
+    BASE_URL = "https://api.deepseek.com"
+
+    def __init__(self, model: str, api_key: str | None = None) -> None:
+        from openai import AsyncOpenAI
+
+        key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+        if not key:
+            raise ValueError("DEEPSEEK_API_KEY is not set (add it to .env).")
+        self.model = model
+        self._client = AsyncOpenAI(api_key=key, base_url=self.BASE_URL, timeout=REQUEST_TIMEOUT_S)
+        self._json_mode = True
+
+    async def generate(self, system: str, prompt: str, temperature: float) -> List[str]:
+        from openai import BadRequestError
+
+        kwargs = dict(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+        )
+        try:
+            if self._json_mode:
+                response = await self._client.chat.completions.create(
+                    **kwargs, response_format={"type": "json_object"}
+                )
+            else:
+                response = await self._client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            if not self._json_mode or "response_format" not in str(e).lower():
+                raise
+            logger.info("%s does not support JSON mode; parsing plain text.", self.model)
+            self._json_mode = False
+            response = await self._client.chat.completions.create(**kwargs)
+        return parse_rules(response.choices[0].message.content or "", self.model)
+
+
+def parse_rules(text: str, model: str) -> List[str]:
+    """Rules from a reply that should be {"rules": [...]}, tolerating code fences."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rsplit("```", 1)[0]
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise RuntimeError(f"{model} returned no JSON object: {text[:200]!r}")
+    return Rules.model_validate_json(text[start : end + 1]).rules
+
+
 def make_generator(model: str) -> RuleGenerator:
     """Pick a backend from the model name."""
     name = model.lower()
+    if name.startswith("deepseek"):
+        return DeepSeekGenerator(model)
     if name.startswith("gemini"):
         return GoogleGenerator(model)
     if name.startswith(("gpt", "o1", "o3", "o4", "o5")):
         return OpenAIGenerator(model)
     raise ValueError(
-        f"Unknown generation model {model!r}. Use a gemini-* or gpt-* model, "
-        "or pass a RuleGenerator instance."
+        f"Unknown generation model {model!r}. Use a deepseek-*, gemini-* or gpt-* "
+        "model, or pass a RuleGenerator instance."
     )

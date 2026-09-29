@@ -53,17 +53,17 @@ class BoostConfig:
 
     Args:
         show_fraction: Share of training rows in the show pool P. The LLM
-            only ever sees labels from P; every accept/reject decision is
-            made on the validation pool V (the rest).
+            only ever sees labels from P; every decision is scored on the
+            validation pool V (the rest).
         seed_examples_per_class: Rows per class shown for the seed round.
         hard_examples: Mis-predicted P rows shown per boosting round.
         contrast_examples: Correctly predicted P rows (same true class) shown
             alongside them.
         rules_per_round: Candidate rules requested per generation call.
         max_rounds: Hard cap on boosting rounds (after the seed round).
-        patience: Stop after this many consecutive rounds with no accepted rule.
-        min_hard_residual: A P row counts as "hard" when |y - p| exceeds this.
-        min_hard_count: Skip a direction with fewer hard rows than this.
+        rel_epsilon: Stop when a round lowers validation log-loss by less than
+            this fraction of its current value (0.003 = 0.3%). Relative, so
+            the same value works whatever the class balance.
         fire_rate_range: Keep a rule only if its mean probability on V lies in
             this range; outside it the rule is nearly constant.
         max_redundancy: Reject a rule whose correlation with any pooled rule
@@ -73,10 +73,6 @@ class BoostConfig:
             the rows the LLM saw, not the pattern).
         min_generality_signal: Only apply the generality check when the
             P-side residual correlation is at least this large.
-        accept_z: A rule is accepted only if the mean per-row log-loss
-            improvement on V exceeds this many standard errors.
-        min_positives_per_rule: Data-driven cap on active rules: the minority
-            class count divided by this.
     """
 
     show_fraction: float = 0.3
@@ -85,21 +81,19 @@ class BoostConfig:
     contrast_examples: int = 20
     rules_per_round: int = 10
     max_rounds: int = 15
-    patience: int = 2
-    min_hard_residual: float = 0.5
-    min_hard_count: int = 10
+    rel_epsilon: float = 0.003
     fire_rate_range: Tuple[float, float] = (0.03, 0.97)
     max_redundancy: float = 0.8
     generality_ratio: float = 0.3
     min_generality_signal: float = 0.1
-    accept_z: float = 1.0
-    min_positives_per_rule: int = 10
     threshold_grid: Tuple[float, ...] = field(
         default_factory=lambda: tuple(np.round(np.linspace(0.01, 0.99, 99), 2))
     )
     threshold_smoothing: int = 5
 
     def __post_init__(self) -> None:
+        if self.rel_epsilon < 0:
+            raise ValueError("rel_epsilon must be >= 0")
         if not 0 < self.show_fraction < 1:
             raise ValueError("show_fraction must be in (0, 1)")
         lo, hi = self.fire_rate_range

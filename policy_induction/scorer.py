@@ -93,6 +93,8 @@ class JevScorer:
             features a model is trained on never drift under it.
         cache_path: SQLite file for cached answers. None disables caching.
         concurrency: Requests in flight at once.
+        max_rpm: Request starts per minute. Jev's documented limit is 1,200;
+            staying just under it avoids a stream of 429 retries.
         api_key: Overrides ``TYPESAFE_API_KEY``.
     """
 
@@ -101,6 +103,7 @@ class JevScorer:
         model: str = "jev-latest",
         cache_path: str | Path | None = None,
         concurrency: int = 16,
+        max_rpm: int = 1100,
         api_key: str | None = None,
     ) -> None:
         self.requested_model = model
@@ -108,6 +111,9 @@ class JevScorer:
         # short names (jev-latest, jev-1.13) are pinned on the first response.
         self.version: str | None = model if _is_full_version(model) else None
         self.concurrency = concurrency
+        self._min_interval = 60.0 / max_rpm
+        self._next_start = 0.0
+        self._rate_lock = asyncio.Lock()
         self._api_key = api_key
         self._client: Any = None
         self._cache = AnswerCache(Path(cache_path)) if cache_path else None
@@ -130,6 +136,7 @@ class JevScorer:
         for i in range(0, len(rules), MAX_RULES_PER_REQUEST):
             chunk = list(rules[i : i + MAX_RULES_PER_REQUEST])
             questions = {f"r{j}": Noul(instructions=r) for j, r in enumerate(chunk)}
+            await self._throttle()
             response = await client.system_one(
                 state=state,
                 questions=questions,
@@ -148,6 +155,15 @@ class JevScorer:
             for j, r in enumerate(chunk):
                 out[r] = float(response.answers[f"r{j}"].noul)
         return out
+
+    async def _throttle(self) -> None:
+        """Space request starts at least ``60 / max_rpm`` seconds apart."""
+        loop = asyncio.get_running_loop()
+        async with self._rate_lock:
+            wait = self._next_start - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._next_start = max(loop.time(), self._next_start) + self._min_interval
 
     async def score(
         self, states: Sequence[Dict[str, Any]], rules: Sequence[str]
