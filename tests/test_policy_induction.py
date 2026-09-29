@@ -267,3 +267,48 @@ def test_rules_accept_wrapped_objects():
 
     text = '{"rules": [{"rule": "`a` is long"}, {"text": "`b` is short"}, "`c` is empty"]}'
     assert parse_rules(text, "m") == ["`a` is long", "`b` is short", "`c` is empty"]
+
+
+async def test_jev_scorer_retries_failed_rows(monkeypatch):
+    from types import SimpleNamespace
+
+    from policy_induction import JevScorer
+
+    monkeypatch.setattr("policy_induction.scorer.RETRY_PASS_WAITS_S", (0, 0))
+    attempts = {}
+
+    class FlakyClient:
+        async def system_one(self, state, questions, model):
+            key = state["t"]
+            attempts[key] = attempts.get(key, 0) + 1
+            if key in {"1", "3"} and attempts[key] == 1:  # fail once, then work
+                raise ConnectionError("temporary DNS failure")
+            answers = {k: SimpleNamespace(noul=0.7) for k in questions}
+            return SimpleNamespace(
+                model="jev-9.9.9", usage=SimpleNamespace(input_tokens=1), answers=answers
+            )
+
+    scorer = JevScorer(model="jev-9.9.9", max_rpm=100_000)
+    scorer._client = FlakyClient()
+    F = await scorer.score([{"t": str(i)} for i in range(5)], ["rule"])
+    assert not np.isnan(F).any()
+    assert attempts["1"] == 2 and attempts["0"] == 1
+
+
+async def test_fit_refuses_to_train_on_missing_scores(tmp_path):
+    X, y = make_data()
+
+    class HoleyScorer(FakeScorer):
+        async def score(self, states, rules):
+            out = await super().score(states, rules)
+            if len(rules) and any("beta" in r for r in rules):
+                out[7, 0] = np.nan  # one row never scored
+            return out
+
+    model = PolicyInduction(
+        task_description=TASK, gen_model=FakeGenerator(), scorer=HoleyScorer(),
+        save_path=tmp_path / "run",
+    )
+    with pytest.raises(RuntimeError, match="could not be scored"):
+        await model.fit(X, y)
+    assert (tmp_path / "run" / "checkpoint.json").exists()  # resumable

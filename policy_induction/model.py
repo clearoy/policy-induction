@@ -411,18 +411,22 @@ class PolicyInduction:
     # ── Scoring / generation plumbing ──────────────────────────────────────
 
     async def _score(self, scorer: Scorer, states, rules: List[str]) -> Dict[str, np.ndarray]:
+        """Training features. Refuses to proceed with any missing answer.
+
+        Imputing a missing score would silently train on made-up features, so
+        a scoring failure aborts fit(). Every answer already obtained is
+        cached and the last finished round is checkpointed, so re-running
+        resumes and only re-requests what is missing.
+        """
         F = await scorer.score(states, rules)
-        out = {}
-        for j, r in enumerate(rules):
-            col = F[:, j]
-            n_nan = int(np.isnan(col).sum())
-            if n_nan == len(col):
-                raise RuntimeError(f"Rule could not be scored on any row: {r!r}")
-            if n_nan:
-                logger.warning("Rule %r: %d unscored rows filled with the rule mean.", r, n_nan)
-                col = np.where(np.isnan(col), np.nanmean(col), col)
-            out[r] = col
-        return out
+        n_missing_rows = int(np.isnan(F).any(axis=1).sum())
+        if n_missing_rows:
+            raise RuntimeError(
+                f"{n_missing_rows} of {len(states)} rows could not be scored by Jev "
+                "(network or API errors). Re-run fit() with the same save_path to "
+                "resume; answers already obtained are cached."
+            )
+        return {r: F[:, j] for j, r in enumerate(rules)}
 
     def _get_scorer(self) -> Scorer:
         if self._scorer is None:

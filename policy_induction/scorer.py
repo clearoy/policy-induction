@@ -26,6 +26,9 @@ from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
+# Waits before each extra pass over rows whose request failed.
+RETRY_PASS_WAITS_S = (15, 60, 180)
+
 # Jev evaluates up to 64k tokens per request (state + all questions). Rules are
 # short, so this is a generous safety bound rather than a tight one.
 MAX_RULES_PER_REQUEST = 64
@@ -44,7 +47,11 @@ class Scorer(Protocol):
     async def score(
         self, states: Sequence[Dict[str, Any]], rules: Sequence[str]
     ) -> np.ndarray:
-        """Return an array of shape (len(states), len(rules)); NaN = failed."""
+        """Return an array of shape (len(states), len(rules)); NaN = failed.
+
+        Implementations should retry transient failures themselves; NaN means
+        the answer could not be obtained at all.
+        """
         ...
 
 
@@ -198,30 +205,38 @@ class JevScorer:
             if missing:
                 todo.append((i, missing))
 
-        if not todo:
-            return result
-
         sem = asyncio.Semaphore(self.concurrency)
-        failures = 0
 
-        async def run(i: int, missing: List[str]) -> None:
-            nonlocal failures
+        async def run(i: int, missing: List[str]) -> bool:
             async with sem:
                 try:
                     answers = await self._ask(states[i], missing)
-                except Exception:
-                    failures += 1
-                    logger.warning("Jev scoring failed for row %d", i, exc_info=True)
-                    return
+                except Exception as e:  # the SDK has already retried this request
+                    logger.debug("Jev scoring failed for row %d: %s", i, e)
+                    return False
             for r, v in answers.items():
                 result[i, rule_pos[r]] = v
             self._store(skeys[i], answers)
+            return True
 
-        tasks = [asyncio.create_task(run(i, m)) for i, m in todo]
-        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="[JEV]"):
-            await fut
-        if failures:
-            logger.warning("%d/%d rows failed to score.", failures, len(todo))
+        # Rows that fail (network drops, overload) get further passes after a
+        # pause, so a short outage does not leave holes in the features.
+        for attempt, wait in enumerate((0, *RETRY_PASS_WAITS_S)):
+            if not todo:
+                break
+            if wait:
+                logger.warning(
+                    "%d rows failed to score; retrying them in %ds (pass %d/%d).",
+                    len(todo), wait, attempt + 1, len(RETRY_PASS_WAITS_S) + 1,
+                )
+                await asyncio.sleep(wait)
+            tasks = [asyncio.create_task(run(i, m)) for i, m in todo]
+            desc = "[JEV]" if attempt == 0 else f"[JEV retry {attempt}]"
+            for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=desc):
+                await fut
+            todo = [(i, m) for (i, m), t in zip(todo, tasks) if not t.result()]
+        if todo:
+            logger.warning("%d rows could not be scored after all retry passes.", len(todo))
         return result
 
     def _store(self, skey: str, answers: Dict[str, float]) -> None:
