@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+policy_induction_run/
+runs/
+*.sqlite
+.DS_Store
+
+# Datasets (may be proprietary) and experiment outputs
+experiments/**/data/
+experiments/**/results/
+experiments/**/runs/
+*.egg-info/

@@ -1,0 +1,107 @@
+"""Configuration for PolicyInduction.
+
+User-facing knobs live on the ``PolicyInduction`` constructor and in
+``WeightConfig``. Everything in ``BoostConfig`` is an internal default with a
+reason behind it; it is exposed only so experiments can override it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Tuple
+
+import numpy as np
+
+
+@dataclass
+class WeightConfig:
+    """How rule weights, regularisation and the decision threshold are chosen.
+
+    Args:
+        beta: F-beta used only to pick the decision threshold (<1 favours
+            precision, >1 favours recall). Model selection itself uses
+            log-loss, which does not depend on a threshold.
+        Cs: Candidate inverse regularisation strengths for L1 logistic
+            regression.
+        cv_folds: Folds per cross-validation repeat.
+        cv_repeats: Repeats of the final cross-validation. Out-of-fold
+            probabilities are averaged over repeats.
+        one_se_rule: For the final model, pick the most regularised C whose
+            validation log-loss is within one standard error of the best.
+        class_weight_balanced: Reweight classes inversely to frequency.
+    """
+
+    beta: float = 0.5
+    Cs: Tuple[float, ...] = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0)
+    cv_folds: int = 5
+    cv_repeats: int = 3
+    one_se_rule: bool = True
+    class_weight_balanced: bool = False
+
+    def __post_init__(self) -> None:
+        if self.beta <= 0:
+            raise ValueError("beta must be positive")
+        if not self.Cs:
+            raise ValueError("Cs must contain at least one value")
+        if self.cv_folds < 2 or self.cv_repeats < 1:
+            raise ValueError("cv_folds must be >= 2 and cv_repeats >= 1")
+
+
+@dataclass
+class BoostConfig:
+    """Internal constants of the boosting loop.
+
+    Args:
+        show_fraction: Share of training rows in the show pool P. The LLM
+            only ever sees labels from P; every accept/reject decision is
+            made on the validation pool V (the rest).
+        seed_examples_per_class: Rows per class shown for the seed round.
+        hard_examples: Mis-predicted P rows shown per boosting round.
+        contrast_examples: Correctly predicted P rows (same true class) shown
+            alongside them.
+        rules_per_round: Candidate rules requested per generation call.
+        max_rounds: Hard cap on boosting rounds (after the seed round).
+        patience: Stop after this many consecutive rounds with no accepted rule.
+        min_hard_residual: A P row counts as "hard" when |y - p| exceeds this.
+        min_hard_count: Skip a direction with fewer hard rows than this.
+        fire_rate_range: Keep a rule only if its mean probability on V lies in
+            this range; outside it the rule is nearly constant.
+        max_redundancy: Reject a rule whose correlation with any pooled rule
+            exceeds this.
+        generality_ratio: Reject a rule whose residual correlation on V is
+            below this fraction of its residual correlation on P (it fits
+            the rows the LLM saw, not the pattern).
+        min_generality_signal: Only apply the generality check when the
+            P-side residual correlation is at least this large.
+        accept_z: A rule is accepted only if the mean per-row log-loss
+            improvement on V exceeds this many standard errors.
+        min_positives_per_rule: Data-driven cap on active rules: the minority
+            class count divided by this.
+    """
+
+    show_fraction: float = 0.3
+    seed_examples_per_class: int = 20
+    hard_examples: int = 20
+    contrast_examples: int = 20
+    rules_per_round: int = 10
+    max_rounds: int = 15
+    patience: int = 2
+    min_hard_residual: float = 0.5
+    min_hard_count: int = 10
+    fire_rate_range: Tuple[float, float] = (0.03, 0.97)
+    max_redundancy: float = 0.8
+    generality_ratio: float = 0.3
+    min_generality_signal: float = 0.1
+    accept_z: float = 1.0
+    min_positives_per_rule: int = 10
+    threshold_grid: Tuple[float, ...] = field(
+        default_factory=lambda: tuple(np.round(np.linspace(0.01, 0.99, 99), 2))
+    )
+    threshold_smoothing: int = 5
+
+    def __post_init__(self) -> None:
+        if not 0 < self.show_fraction < 1:
+            raise ValueError("show_fraction must be in (0, 1)")
+        lo, hi = self.fire_rate_range
+        if not 0 <= lo < hi <= 1:
+            raise ValueError("fire_rate_range must satisfy 0 <= lo < hi <= 1")

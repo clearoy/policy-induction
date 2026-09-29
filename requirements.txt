@@ -1,0 +1,16 @@
+# Scoring model (TypeSafe Jev)
+typesafe-sdk>=0.7
+# Rule-generation LLMs
+openai>=1.106
+google-genai>=1.33
+# Numerics / modelling
+numpy>=2.0
+pandas>=2.2
+scikit-learn>=1.8
+joblib>=1.4
+pydantic>=2.7
+python-dotenv>=1.0
+tqdm>=4.66
+# Dev
+pytest>=8.0
+pytest-asyncio>=0.24

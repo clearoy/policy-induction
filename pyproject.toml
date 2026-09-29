@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "policy-induction"
+version = "0.1.0"
+description = "Boosted, interpretable binary classification with LLM-written rules scored by TypeSafe Jev"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typesafe-sdk>=0.7",
+    "openai>=1.106",
+    "google-genai>=1.33",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scikit-learn>=1.8",
+    "joblib>=1.4",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.setuptools.packages.find]
+include = ["policy_induction*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
