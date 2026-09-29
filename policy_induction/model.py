@@ -17,8 +17,9 @@ Rules live in a single, expand-only pool. Each round:
     5. refit on the grown pool and measure out-of-fold log-loss on the
        validation pool V, rows the LLM never sees
 
-Stop when the pool reaches ``max_policy_length`` or a round improves V
-log-loss by less than ``BoostConfig.rel_epsilon`` (relative). Nothing is ever
+Stop when the pool reaches ``max_policy_length`` or ``BoostConfig.patience``
+consecutive rounds each improve V log-loss by less than
+``BoostConfig.rel_epsilon`` (relative). Nothing is ever
 removed from the pool: L1 decides which rules carry weight, and only rules
 with non-zero weight are asked at prediction time.
 """
@@ -62,7 +63,7 @@ MAX_FIELD_CHARS_IN_PROMPT = 1500
 _CHECKPOINT = "checkpoint.json"
 # Bumped whenever the checkpoint layout changes, so an old checkpoint is
 # ignored rather than misread. The Jev answer cache is unaffected.
-_CHECKPOINT_FORMAT = 2
+_CHECKPOINT_FORMAT = 3
 
 
 class _Eval(NamedTuple):
@@ -81,8 +82,10 @@ class PolicyInduction:
         gen_model: Generation LLM name (``gpt-*``, ``deepseek-*``, ``gemini-*``)
             or any object implementing ``RuleGenerator``.
         max_policy_length: Size cap of the rule pool (<= 100). Boosting stops
-            when the pool is full. The final model uses the pooled rules that
-            L1 gives a non-zero weight, usually far fewer.
+            when the pool is full. Every admitted rule stays in the pool, so
+            the pool grows by up to ``rules_per_round`` per round; the final
+            model uses only the rules L1 gives a non-zero weight, usually far
+            fewer.
         gen_temperature: Sampling temperature of the generation LLM.
         random_state: Seeds the P/V split, example selection and CV folds.
             It does not make the generation LLM deterministic.
@@ -98,7 +101,7 @@ class PolicyInduction:
         self,
         task_description: str,
         gen_model: str | RuleGenerator = "gpt-5.6",
-        max_policy_length: int = 30,
+        max_policy_length: int = 100,
         gen_temperature: float = 1.0,
         random_state: int = 0,
         weight_config: WeightConfig | None = None,
@@ -163,10 +166,10 @@ class PolicyInduction:
 
         fingerprint = _fingerprint(states, y01, self.random_state, bc.show_fraction)
         ckpt = self._read_checkpoint(fingerprint)
-        start_round = 0
+        start_round, stale = 0, 0
         if ckpt:
             self.pool, self.tried, self.history = ckpt["pool"], ckpt["tried"], ckpt["history"]
-            start_round = ckpt["next_round"]
+            start_round, stale = ckpt["next_round"], ckpt["stale"]
             logger.info("Resuming at round %d with %d pooled rules.", start_round, len(self.pool))
 
         cols: Dict[str, np.ndarray] = {}
@@ -224,8 +227,10 @@ class PolicyInduction:
                 rnd, direction, len(log["added"]), len(self.pool),
                 before.val_loss, after.val_loss, 100 * rel,
             )
-            self._write_checkpoint(fingerprint, rnd + 1)
-            if rel < bc.rel_epsilon:
+            # One weak round (an unlucky LLM batch) is not enough to stop.
+            stale = stale + 1 if rel < bc.rel_epsilon else 0
+            self._write_checkpoint(fingerprint, rnd + 1, stale)
+            if stale >= bc.patience:
                 stop_reason = "converged"
                 break
 
@@ -448,12 +453,12 @@ class PolicyInduction:
             return None
         return data
 
-    def _write_checkpoint(self, fingerprint: str, next_round: int) -> None:
+    def _write_checkpoint(self, fingerprint: str, next_round: int, stale: int) -> None:
         self.save_path.mkdir(parents=True, exist_ok=True)
         tmp = self.save_path / (_CHECKPOINT + ".tmp")
         tmp.write_text(json.dumps({
             "format": _CHECKPOINT_FORMAT, "fingerprint": fingerprint,
-            "next_round": next_round, "pool": self.pool, "tried": self.tried,
+            "next_round": next_round, "stale": stale, "pool": self.pool, "tried": self.tried,
             "history": self.history,
         }))
         tmp.replace(self.save_path / _CHECKPOINT)

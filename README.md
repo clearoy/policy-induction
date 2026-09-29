@@ -27,8 +27,8 @@ round 1..R
   4. a new rule joins the pool unless it is near-constant, a near-duplicate of
      a pooled rule, or fits P but not V
   5. refit on the grown pool; measure out-of-fold log-loss on V
-stop        the pool reaches max_policy_length, or a round lowers V log-loss by
-            less than rel_epsilon (0.3%, relative)
+stop        the pool reaches max_policy_length, or 2 consecutive rounds each
+            lower V log-loss by less than rel_epsilon (0.3%, relative)
 finish      choose C by the one-standard-error rule, then the decision threshold
             on V's pooled out-of-fold probabilities
 predict     ask Jev only the rules with non-zero weight; mean P(YES) of the 15
@@ -95,7 +95,6 @@ async def main():
     model = PolicyInduction(
         task_description="Predict whether ... YES means ..., NO means ...",
         gen_model="gpt-5.6",
-        max_policy_length=30,
         weight_config=WeightConfig(beta=0.5),
         save_path="runs/my_run",
     )
@@ -117,13 +116,13 @@ Reload a saved model with `PolicyInduction.load("runs/my_run")`.
 |---|---|---|
 | `task_description` | required | What is predicted and what YES/NO mean. The input that most shapes the rules |
 | `gen_model` | `gpt-5.6` | Rule-writing LLM (`gpt-*`, `deepseek-*`, `gemini-*`, or any `RuleGenerator`) |
-| `max_policy_length` | 30 | Size cap of the rule pool (<= 100); boosting stops when it is full |
+| `max_policy_length` | 100 | Size cap of the rule pool (<= 100); boosting stops when it is full. The pool grows by up to 10 rules per round |
 | `gen_temperature` | 1.0 | Sampling temperature of the rule-writing LLM |
 | `random_state` | 0 | P/V split, example selection and CV folds. **Does not control the LLM** |
 | `weight_config` | `WeightConfig()` | `beta` (threshold only), `Cs`, `cv_folds`, `cv_repeats`, `one_se_rule`, `class_weight_balanced` |
 
 `BoostConfig` holds the internal boosting constants (show-pool share, rules per
-round, filter thresholds, `rel_epsilon`). They rarely need changing.
+round, filter thresholds, `rel_epsilon`, `patience`). They rarely need changing.
 
 ## Outputs
 

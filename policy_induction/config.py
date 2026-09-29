@@ -61,9 +61,11 @@ class BoostConfig:
             alongside them.
         rules_per_round: Candidate rules requested per generation call.
         max_rounds: Hard cap on boosting rounds (after the seed round).
-        rel_epsilon: Stop when a round lowers validation log-loss by less than
-            this fraction of its current value (0.003 = 0.3%). Relative, so
-            the same value works whatever the class balance.
+        rel_epsilon: A round counts as stalled when it lowers validation
+            log-loss by less than this fraction of its current value
+            (0.003 = 0.3%). Relative, so the same value works whatever the
+            class balance.
+        patience: Stop after this many consecutive stalled rounds.
         fire_rate_range: Keep a rule only if its mean probability on V lies in
             this range; outside it the rule is nearly constant.
         max_redundancy: Reject a rule whose correlation with any pooled rule
@@ -82,6 +84,7 @@ class BoostConfig:
     rules_per_round: int = 10
     max_rounds: int = 15
     rel_epsilon: float = 0.003
+    patience: int = 2
     fire_rate_range: Tuple[float, float] = (0.03, 0.97)
     max_redundancy: float = 0.8
     generality_ratio: float = 0.3
@@ -94,6 +97,8 @@ class BoostConfig:
     def __post_init__(self) -> None:
         if self.rel_epsilon < 0:
             raise ValueError("rel_epsilon must be >= 0")
+        if self.patience < 1:
+            raise ValueError("patience must be >= 1")
         if not 0 < self.show_fraction < 1:
             raise ValueError("show_fraction must be in (0, 1)")
         lo, hi = self.fire_rate_range

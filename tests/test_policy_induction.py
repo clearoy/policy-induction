@@ -85,8 +85,9 @@ async def test_stops_at_pool_cap(tmp_path):
 
 async def test_stops_when_relative_gain_below_epsilon(tmp_path):
     X, y = make_data()
-    # After the seed round this generator only offers noise words, so the
-    # first boosting round cannot lower validation log-loss by 0.3%.
+    # After the seed round this generator only offers noise words, so no
+    # boosting round can lower validation log-loss by 0.3%; with patience 2
+    # training stops after the second such round.
     class NoiseAfterSeed(FakeGenerator):
         async def generate(self, system, prompt, temperature):
             rules = await super().generate(system, prompt, temperature)
@@ -96,8 +97,8 @@ async def test_stops_when_relative_gain_below_epsilon(tmp_path):
 
     model = await make_model(tmp_path, gen=NoiseAfterSeed()).fit(X, y)
     assert model.metrics["stop_reason"] == "converged"
-    assert len(model.history) == 2
-    assert model.history[-1]["relative_improvement"] < BoostConfig().rel_epsilon
+    assert len(model.history) == 3
+    assert all(h["relative_improvement"] < BoostConfig().rel_epsilon for h in model.history[1:])
 
 
 async def test_even_rounds_show_missed_no_rows(tmp_path):

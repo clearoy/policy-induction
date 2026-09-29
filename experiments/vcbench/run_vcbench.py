@@ -109,6 +109,7 @@ def test_metrics(y_true: np.ndarray, p: np.ndarray, threshold: float) -> dict:
 
 
 async def run(name: str) -> None:
+    commit = git_commit()  # the code this run executes, captured before it can change
     X_train, y_train, _ = load_split("public")
     X_test, y_test, test_ids = load_split("private")
 
@@ -117,7 +118,7 @@ async def run(name: str) -> None:
     handler = logging.FileHandler(out / "run.log")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.getLogger().addHandler(handler)
-    log.info("Run %s: train=%d test=%d gen=%s", name, len(y_train), len(y_test), GEN_MODEL)
+    log.info("Run %s: train=%d test=%d gen=%s commit=%s", name, len(y_train), len(y_test), GEN_MODEL, commit)
 
     scorer = JevScorer(cache_path=out / "jev_cache.sqlite")
     model = PolicyInduction(
@@ -147,7 +148,7 @@ async def run(name: str) -> None:
         cost = scorer.input_tokens / 1e6 * JEV_PRICE_PER_MTOK
         (out / "metrics.json").write_text(json.dumps({
             "name": name,
-            "git_commit": git_commit(),
+            "git_commit": commit,
             "gen_model": GEN_MODEL,
             "jev_version": model.jev_version,
             "n_rules": len(model.rules),
