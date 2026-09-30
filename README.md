@@ -31,8 +31,8 @@ round 1..R
      accepted heuristic, and those that fit P but not V
   6. try each survivor on its own: accept it only if the mean per-row
      log-loss improvement on V exceeds one standard error
-stop        max_policy_length rules accepted, or 2 consecutive rounds each lower
-            V log-loss by less than rel_epsilon (0.3%, relative)
+stop        max_policy_length rules accepted, or 5 consecutive rounds each lower
+            V log-loss by less than rel_epsilon (0.1%, relative)
 finish      choose the C with the lowest V log-loss, then the decision threshold
             on V's pooled out-of-fold probabilities
 predict     ask Jev only the accepted rules with non-zero weight; mean P(YES) of

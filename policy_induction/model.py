@@ -251,7 +251,7 @@ class PolicyInduction:
                 before.val_loss, after_loss, 100 * rel,
             )
 
-            # One weak round (an unlucky LLM batch) is not enough to stop.
+            # A few weak rounds (unlucky LLM batches) are not enough to stop.
             stale = stale + 1 if rel < bc.rel_epsilon else 0
             self._write_checkpoint(fingerprint, rnd + 1, stale)
             if stale >= bc.patience:

@@ -65,7 +65,7 @@ class BoostConfig:
         max_rounds: Hard cap on boosting rounds (after the seed round).
         rel_epsilon: A round counts as stalled when it lowers validation
             log-loss by less than this fraction of its current value
-            (0.003 = 0.3%). Relative, so the same value works whatever the
+            (0.001 = 0.1%). Relative, so the same value works whatever the
             class balance. A round that accepts no rule improves by 0.
         patience: Stop after this many consecutive stalled rounds.
         accept_z: A rule is accepted only if the mean per-row log-loss
@@ -88,8 +88,8 @@ class BoostConfig:
     contrast_examples: int = 20
     rules_per_round: int = 10
     max_rounds: int = 15
-    rel_epsilon: float = 0.003
-    patience: int = 2
+    rel_epsilon: float = 0.001
+    patience: int = 5
     accept_z: float = 1.0
     min_spread: float = 0.02
     max_redundancy: float = 0.8
