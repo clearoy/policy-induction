@@ -6,7 +6,7 @@ import logging
 import os
 from typing import List, Protocol
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +16,22 @@ REQUEST_TIMEOUT_S = 180
 
 
 class Rules(BaseModel):
-    rules: List[str] = Field(..., description="The proposed rules.")
+    """Generation output: {"policies": [...]} ("rules" is accepted too)."""
 
-    @field_validator("rules", mode="before")
+    policies: List[str] = Field(
+        ...,
+        description="The proposed policies.",
+        validation_alias=AliasChoices("policies", "rules"),
+    )
+
+    @property
+    def rules(self) -> List[str]:
+        return self.policies
+
+    @field_validator("policies", mode="before")
     @classmethod
     def _unwrap_objects(cls, value):
-        """Accept [{"rule": "..."}] as well as ["..."].
+        """Accept [{"policy": "..."}] as well as ["..."].
 
         JSON-mode models (DeepSeek) sometimes wrap each rule in an object,
         especially after seeing rules listed with metadata in the prompt.
@@ -32,7 +42,10 @@ class Rules(BaseModel):
         for item in value:
             if isinstance(item, dict):
                 texts = [v for v in item.values() if isinstance(v, str) and v.strip()]
-                item = item.get("rule") or item.get("text") or (texts[0] if texts else item)
+                item = (
+                    item.get("policy") or item.get("rule") or item.get("text")
+                    or (texts[0] if texts else item)
+                )
             out.append(item)
         return out
 
@@ -160,7 +173,7 @@ class DeepSeekGenerator:
 
 
 def parse_rules(text: str, model: str) -> List[str]:
-    """Rules from a reply that should be {"rules": [...]}, tolerating code fences."""
+    """Policies from a reply that should be {"policies": [...]}, tolerating code fences."""
     text = text.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else ""

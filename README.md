@@ -1,8 +1,9 @@
 # PolicyInduction (boosted)
 
-An interpretable binary classifier. An LLM writes natural-language rules,
-[TypeSafe Jev](https://docs.typesafe.ai) scores the probability that each rule
-holds for each sample, and an L1 logistic regression learns a weight per rule.
+An interpretable binary classifier. An LLM writes natural-language heuristics
+(policies), [TypeSafe Jev](https://docs.typesafe.ai) applies each heuristic to
+each sample and returns a probability, and an L1 logistic regression learns a
+weight per heuristic.
 
 Rules are found by **boosting**: every round targets the samples the current
 model gets wrong, and a new rule is kept only if it lowers the error on data the
@@ -20,15 +21,19 @@ round 1..R
   2. residual g = y - p; take the P rows of one class the model gets most wrong:
      missed YES rows on odd rounds, missed NO rows on even rounds, plus
      correctly handled rows of the same class as contrast
-  3. the LLM sees those rows, the accepted rules (with weights) and the rules
-     already tried without success, and proposes new rules -> Jev scores them
-  4. filter out rules that are near-constant, near-duplicates of an accepted
-     rule, or fit P but not V
-  5. try each survivor on its own: accept it only if the mean per-row
+  3. the LLM sees those rows, the accepted heuristics (with weights) and those
+     already tried without success, and proposes new heuristics
+  4. Jev scores each new heuristic on every row through jev_template, e.g.
+     "Investor heuristic (guidance, not a strict rule): {policy}. Considering
+     this heuristic along with the founder's full profile, will this founder
+     be successful?"
+  5. filter out heuristics whose scores barely vary, near-duplicates of an
+     accepted heuristic, and those that fit P but not V
+  6. try each survivor on its own: accept it only if the mean per-row
      log-loss improvement on V exceeds one standard error
 stop        max_policy_length rules accepted, or 2 consecutive rounds each lower
-            V log-loss by less than rel_epsilon (0.1%, relative)
-finish      choose C by the one-standard-error rule, then the decision threshold
+            V log-loss by less than rel_epsilon (0.3%, relative)
+finish      choose the C with the lowest V log-loss, then the decision threshold
             on V's pooled out-of-fold probabilities
 predict     ask Jev only the accepted rules with non-zero weight; mean P(YES) of
             the 15 fold models >= threshold -> YES
@@ -39,7 +44,8 @@ predict     ask Jev only the accepted rules with non-zero weight; mean P(YES) of
 - **Nothing is forgotten**: accepted rules are never removed (L1 shrinks any
   that later rules make redundant), and rejected rules are listed in later
   prompts so the LLM does not propose them again.
-- **Features are probabilities**: Jev's `noul`, P(rule holds), not 0/1.
+- **Features are probabilities**: Jev's `noul` for the templated question,
+  not 0/1.
 - **"Missed" is relative**: the largest residuals within a class, so the NO
   side is shown even on imbalanced data where no row gets P(YES) > 0.5.
 - **Jev version is pinned.** The concrete version answering the first request
@@ -121,11 +127,12 @@ Reload a saved model with `PolicyInduction.load("runs/my_run")`.
 | `max_policy_length` | 100 | Cap on accepted rules (<= 100); boosting usually stops earlier |
 | `gen_temperature` | 1.0 | Sampling temperature of the rule-writing LLM |
 | `random_state` | 0 | P/V split, example selection and CV folds. **Does not control the LLM** |
+| `jev_template` | generic | How each heuristic is put to Jev; must contain `{policy}`, may contain `{task}` |
 | `weight_config` | `WeightConfig()` | `beta` (threshold only), `Cs`, `cv_folds`, `cv_repeats`, `one_se_rule`, `class_weight_balanced` |
 
 `BoostConfig` holds the internal boosting constants (show-pool share, rules per
-round, filter thresholds, `accept_z`, `rel_epsilon`, `patience`). They rarely need
-changing.
+round, `min_spread`, `max_redundancy`, `accept_z`, `rel_epsilon`, `patience`).
+They rarely need changing.
 
 ## Outputs
 
@@ -156,24 +163,39 @@ positive). Put `vcbench_final_public.csv` and `vcbench_final_private.csv` in
 ```
 
 It trains on all public rows (anonymised profile text, as in the earlier
-think-reason-learn runs) and evaluates on all private rows, writing rules with
-`deepseek-chat`. Settings such as the generation model live as constants at the top of the script. Re-running
+think-reason-learn runs) and evaluates on all private rows, writing heuristics
+with `deepseek-v4-pro` and scoring them with an investor-heuristic Jev
+template. Settings such as the generation model and the template live as
+constants at the top of the script. Re-running
 resumes an interrupted run; `--name` keeps separate runs apart.
 
 Results go to `experiments/vcbench/runs/<name>/` (gitignored): `report.md`,
 `model.json`, `predictions.csv`, `metrics.json` (validation and test metrics,
 Jev cost, git commit) and `run.log`.
 
-## How rules are written
+## How policies are written
 
-Jev judges each rule literally and one at a time, and is weak at arithmetic,
-compound conditions and multi-step reasoning. The generation prompt therefore
-requires every rule to:
+The generation LLM writes **investor-style heuristics**: one short sentence an
+experienced investor would use to judge a case, drawn from domain knowledge as
+well as the labelled samples it is shown (e.g. "Founders who previously built
+and sold a company are more likely to succeed"). Heuristics should be general,
+focused on one signal, and must not quote samples or name specific people,
+companies or numbers.
 
-- describe exactly one observable condition (no "and"/"or")
-- state a condition, not a verdict (the weight decides the direction)
-- name fields in backticks, e.g. `` `profile` ``
-- avoid quoting samples or naming specific people, companies or numbers
+Jev does not see a system prompt. Each request carries one sample as `state`
+and one question per heuristic, rendered with `jev_template` (must contain
+`{policy}`, may contain `{task}`). The same template is used for training and
+prediction, and it is part of the Jev answer cache key and the checkpoint
+fingerprint.
+
+**Reading the weights.** Every question asks about the outcome, so all
+features share a component ("how promising is this case overall"). The
+regression often gives correlated heuristics large weights of opposite sign to
+isolate what differs between them: a heuristic that is positively related to
+success on its own can end with a negative weight. Weights are conditional
+effects, not the direction stated in the heuristic's text. Setting
+`jev_template="{policy}"` with condition-style policies avoids this at the
+cost of weaker features.
 
 ## Known limitations
 
@@ -205,7 +227,7 @@ policy_induction/
   weights.py     cross-validation, choosing C, threshold
   scorer.py      Jev scoring, version pinning, SQLite cache, rate limit
   generator.py   rule-writing LLMs (OpenAI / DeepSeek / Gemini)
-  prompts.py     generation prompts and rule-writing constraints
+  prompts.py     generation prompts and the default Jev template
   config.py      WeightConfig, BoostConfig
 experiments/
   vcbench/run_vcbench.py

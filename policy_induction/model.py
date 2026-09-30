@@ -41,7 +41,7 @@ from sklearn.metrics import precision_score, recall_score, roc_auc_score
 
 from .config import BoostConfig, WeightConfig
 from .generator import RuleGenerator, make_generator
-from .prompts import BOOST_PROMPT, GEN_SYSTEM, SEED_PROMPT
+from .prompts import BOOST_PROMPT, DEFAULT_JEV_TEMPLATE, GEN_SYSTEM, SEED_PROMPT
 from .scorer import JevScorer, Scorer
 from .weights import (
     choose_threshold,
@@ -64,7 +64,7 @@ MAX_REJECTED_IN_PROMPT = 60
 _CHECKPOINT = "checkpoint.json"
 # Bumped whenever the checkpoint layout changes, so an old checkpoint is
 # ignored rather than misread. The Jev answer cache is unaffected.
-_CHECKPOINT_FORMAT = 4
+_CHECKPOINT_FORMAT = 5
 
 
 class _Eval(NamedTuple):
@@ -93,6 +93,9 @@ class PolicyInduction:
         scorer: Rule scorer. Defaults to ``JevScorer`` with an answer cache
             under ``save_path``.
         jev_model: Jev model or alias for the default scorer.
+        jev_template: How each policy is put to Jev as a yes/no question.
+            Must contain ``{policy}``; may contain ``{task}``. Training and
+            prediction always use the same template.
         save_path: Directory for the answer cache, checkpoints and ``save()``.
     """
 
@@ -107,6 +110,7 @@ class PolicyInduction:
         boost_config: BoostConfig | None = None,
         scorer: Scorer | None = None,
         jev_model: str = "jev-latest",
+        jev_template: str = DEFAULT_JEV_TEMPLATE,
         save_path: str | Path = "policy_induction_run",
     ) -> None:
         if not task_description or not task_description.strip():
@@ -115,6 +119,8 @@ class PolicyInduction:
             raise ValueError("max_policy_length must be in [1, 100]")
         if not 0 <= gen_temperature <= 2:
             raise ValueError("gen_temperature must be in [0, 2]")
+        if "{policy}" not in jev_template:
+            raise ValueError("jev_template must contain {policy}")
 
         self.task_description = task_description.strip()
         self.max_policy_length = max_policy_length
@@ -124,6 +130,7 @@ class PolicyInduction:
         self.boost_config = boost_config or BoostConfig()
         self.save_path = Path(save_path)
         self.jev_model = jev_model
+        self.jev_template = jev_template
 
         self._generator: RuleGenerator | None = (
             None if isinstance(gen_model, str) else gen_model
@@ -164,7 +171,9 @@ class PolicyInduction:
         in_p = _split_pools(y01, bc.show_fraction, rng)
         in_v = ~in_p
 
-        fingerprint = _fingerprint(states, y01, self.random_state, bc.show_fraction)
+        fingerprint = _fingerprint(
+            states, y01, self.random_state, bc.show_fraction, self._question("{p}")
+        )
         ckpt = self._read_checkpoint(fingerprint)
         start_round, stale = 0, 0
         if ckpt:
@@ -266,7 +275,7 @@ class PolicyInduction:
         """P(YES) per row. NaN for rows Jev could not score at all."""
         self._check_fitted()
         states = _to_states(X)
-        F = await self._get_scorer().score(states, self.rules)
+        F = await self._get_scorer().score(states, [self._question(r) for r in self.rules])
         all_missing = (
             np.isnan(F).all(axis=1) if self.rules else np.zeros(len(states), dtype=bool)
         )
@@ -353,7 +362,7 @@ class PolicyInduction:
         if self.accepted:
             w = np.mean([m.coef_[0] for m in fold_models], axis=0)
             lines += [
-                f"- [weight {w[i]:+.2f}, holds {cols[r].mean():.0%}] {r}"
+                f"- [{w[i]:+.2f}] {r}"
                 for i, r in enumerate(self.accepted)
             ]
         else:
@@ -365,9 +374,8 @@ class PolicyInduction:
         return "\n".join(lines)
 
     def _filter(self, candidates, cols, g, in_p, in_v, log) -> List[str]:
-        """Cheap checks before any refitting: fire rate, redundancy, generality."""
+        """Cheap checks before any refitting: spread, redundancy, generality."""
         bc = self.boost_config
-        lo, hi = bc.fire_rate_range
         kept: List[str] = []
 
         def reject(reason: str) -> None:
@@ -375,7 +383,7 @@ class PolicyInduction:
 
         for rule in candidates:
             f = cols[rule]
-            if not lo <= f[in_v].mean() <= hi:
+            if f[in_v].std() < bc.min_spread:
                 reject("constant")
                 continue
             if any(abs(corr(f, cols[o])) > bc.max_redundancy for o in self.accepted + kept):
@@ -443,7 +451,7 @@ class PolicyInduction:
         cached and the last finished round is checkpointed, so re-running
         resumes and only re-requests what is missing.
         """
-        F = await scorer.score(states, rules)
+        F = await scorer.score(states, [self._question(r) for r in rules])
         n_missing_rows = int(np.isnan(F).any(axis=1).sum())
         if n_missing_rows:
             raise RuntimeError(
@@ -452,6 +460,10 @@ class PolicyInduction:
                 "resume; answers already obtained are cached."
             )
         return {r: F[:, j] for j, r in enumerate(rules)}
+
+    def _question(self, policy: str) -> str:
+        """The exact text Jev judges for ``policy`` (also its cache key)."""
+        return self.jev_template.format(policy=policy, task=self.task_description)
 
     def _get_scorer(self) -> Scorer:
         if self._scorer is None:
@@ -513,6 +525,7 @@ class PolicyInduction:
             "weight_config": asdict(self.weight_config),
             "boost_config": asdict(self.boost_config),
             "jev_version": self.jev_version,
+            "jev_template": self.jev_template,
             "fields": self.fields,
             "rules": self.rules,
             "accepted": self.accepted,
@@ -538,7 +551,7 @@ class PolicyInduction:
         # Tolerate constants added or removed since the model was saved.
         known = {f.name for f in dataclass_fields(BoostConfig)}
         bc = {k: v for k, v in m["boost_config"].items() if k in known}
-        for k in ("fire_rate_range", "threshold_grid"):
+        for k in ("threshold_grid",):
             if k in bc:
                 bc[k] = tuple(bc[k])
         inst = cls(
@@ -552,6 +565,8 @@ class PolicyInduction:
             scorer=scorer,
             # Predict with exactly the Jev version the weights were fit on.
             jev_model=m["jev_version"] or "jev-latest",
+            # Older manifests predate the template and judged the bare policy.
+            jev_template=m.get("jev_template", "{policy}"),
             save_path=base,
         )
         inst.jev_version = m["jev_version"]
@@ -706,9 +721,10 @@ def _matrix(cols: Dict[str, np.ndarray], rules: List[str], n: int) -> np.ndarray
     return np.column_stack([cols[r] for r in rules])
 
 
-def _fingerprint(states, y01, random_state, show_fraction) -> str:
+def _fingerprint(states, y01, random_state, show_fraction, question_form) -> str:
+    """Identifies the data and everything that changes what the features mean."""
     h = hashlib.sha256()
     h.update(json.dumps(states, sort_keys=True, default=str).encode())
     h.update(y01.tobytes())
-    h.update(f"{random_state}|{show_fraction}".encode())
+    h.update(f"{random_state}|{show_fraction}|{question_form}".encode())
     return h.hexdigest()

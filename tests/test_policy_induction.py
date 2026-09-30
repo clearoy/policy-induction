@@ -231,7 +231,7 @@ async def test_openai_generator_drops_temperature_when_rejected():
                     response=httpx.Response(400, request=req),
                     body=None,
                 )
-            return SimpleNamespace(output_parsed=Rules(rules=["`x` is long"]))
+            return SimpleNamespace(output_parsed=Rules(policies=["`x` is long"]))
 
     gen = OpenAIGenerator("gpt-5.6", api_key="test")
     gen._client = SimpleNamespace(responses=FakeResponses())
@@ -263,7 +263,7 @@ async def test_deepseek_generator_json_mode_and_fallback(monkeypatch):
                     response=httpx.Response(400, request=req),
                     body=None,
                 )
-            text = '```json\n{"rules": ["`x` is long", "`x` is short"]}\n```'
+            text = '```json\n{"policies": ["`x` is long", "`x` is short"]}\n```'
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
 
     gen = DeepSeekGenerator("deepseek-reasoner", api_key="test")
@@ -276,8 +276,10 @@ async def test_deepseek_generator_json_mode_and_fallback(monkeypatch):
 def test_rules_accept_wrapped_objects():
     from policy_induction.generator import parse_rules
 
-    text = '{"rules": [{"rule": "`a` is long"}, {"text": "`b` is short"}, "`c` is empty"]}'
+    text = '{"policies": [{"policy": "`a` is long"}, {"text": "`b` is short"}, "`c` is empty"]}'
     assert parse_rules(text, "m") == ["`a` is long", "`b` is short", "`c` is empty"]
+    # The older "rules" key still parses.
+    assert parse_rules('{"rules": ["`d` is set"]}', "m") == ["`d` is set"]
 
 
 async def test_jev_scorer_retries_failed_rows(monkeypatch):
@@ -323,3 +325,27 @@ async def test_fit_refuses_to_train_on_missing_scores(tmp_path):
     with pytest.raises(RuntimeError, match="could not be scored"):
         await model.fit(X, y)
     assert (tmp_path / "run" / "checkpoint.json").exists()  # resumable
+
+
+async def test_jev_template_wraps_every_question(tmp_path):
+    X, y = make_data()
+    seen = []
+
+    class RecordingScorer(FakeScorer):
+        async def score(self, states, rules):
+            seen.extend(rules)
+            return await super().score(states, rules)
+
+    template = "Heuristic: {policy}\nIs this a positive case for: {task}?"
+    model = PolicyInduction(
+        task_description=TASK, gen_model=FakeGenerator(), scorer=RecordingScorer(),
+        jev_template=template, save_path=tmp_path / "run",
+    )
+    await model.fit(X, y)
+    await model.predict_proba(X.head(5))
+    assert seen and all(q.startswith("Heuristic: ") and TASK in q for q in seen)
+    loaded = PolicyInduction.load(model.save(tmp_path / "saved"), scorer=FakeScorer())
+    assert loaded.jev_template == template
+
+    with pytest.raises(ValueError, match="policy"):
+        PolicyInduction(task_description=TASK, gen_model=FakeGenerator(), jev_template="no slot")

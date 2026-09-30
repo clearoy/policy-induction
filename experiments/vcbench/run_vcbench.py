@@ -53,15 +53,17 @@ from policy_induction import JevScorer, PolicyInduction  # noqa: E402
 
 # ── Settings (edit here) ────────────────────────────────────────────────────
 
-GEN_MODEL = "deepseek-chat"
+GEN_MODEL = "deepseek-v4-pro"
 TEXT_COLUMN = "anonymised_prose"  # same input as the earlier think-reason-learn runs
 TASK = (
-    "Predict whether a startup founder will be successful based on their "
-    "educational background, professional experience, and industry. A "
-    "successful founder (YES) is one whose company has achieved either total "
-    "funding over $500M or an exit/IPO valued over $500M; otherwise NO. All "
-    "founders under consideration are sourced from LinkedIn and Crunchbase "
-    "profiles of companies that have raised between $100K and $4M in funding."
+    "Predict whether a startup founder will be successful, meaning their "
+    "company raised over $500M or exited or IPO'd at over $500M."
+)
+# How each heuristic is put to Jev, one yes/no question per founder.
+JEV_TEMPLATE = (
+    "Investor heuristic (guidance, not a strict rule): {policy}\n"
+    "Considering this heuristic along with the founder's full profile, "
+    "will this founder be successful?"
 )
 BETA = 0.5  # the model's default; used here to report test F-beta
 
@@ -122,7 +124,8 @@ async def run(name: str) -> None:
 
     scorer = JevScorer(cache_path=out / "jev_cache.sqlite")
     model = PolicyInduction(
-        task_description=TASK, gen_model=GEN_MODEL, scorer=scorer, save_path=out
+        task_description=TASK, gen_model=GEN_MODEL, scorer=scorer,
+        jev_template=JEV_TEMPLATE, save_path=out,
     )
     started = time.monotonic()
     try:
@@ -150,6 +153,7 @@ async def run(name: str) -> None:
             "name": name,
             "git_commit": commit,
             "gen_model": GEN_MODEL,
+            "jev_template": JEV_TEMPLATE,
             "jev_version": model.jev_version,
             "n_rules": len(model.rules),
             "validation": {k: v for k, v in model.metrics.items() if k.startswith("val_")},

@@ -1,80 +1,61 @@
-"""Prompts for the rule-generation LLM.
+"""Prompts for the heuristic-generation LLM and the Jev question template.
 
-Rules are judged by Jev, which reads each rule literally, one at a time, and is
-weak at arithmetic, multi-hop logic and compound conditions. The writing
-constraints below are therefore not style advice: a rule that breaks them is
-scored unreliably. The same constraints also make rules generalise, because a
-single observable condition cannot memorise a particular training row.
+The generation LLM writes investor-style heuristics, drawing on its own domain
+knowledge as well as the labelled samples it is shown. Jev then applies each
+heuristic to every sample through ``DEFAULT_JEV_TEMPLATE`` (or a task-specific
+template), answering whether the case is positive when viewed through that
+heuristic. The logistic regression learns how much to trust each heuristic.
 """
 
-RULE_WRITING_RULES = """\
-Each rule is a single statement that is either true or false of ONE sample.
+GEN_SYSTEM = """\
+You write investor heuristics for predicting a binary outcome. Each heuristic
+is one short sentence an experienced investor would use to judge a case, e.g.
+"Founders who previously built and sold a company are more likely to succeed."
+A separate model applies each heuristic to every case, and a logistic
+regression learns how much to trust each one.
 
-Write every rule so that:
-1. It describes exactly one observable condition. No "and", "or", "unless",
-   or nested conditions. If you want two conditions, write two rules.
-2. It states a condition, NOT a verdict. Never write "then YES", "likely to
-   succeed", or anything about the label. The model learns from the data
-   whether a condition points towards YES or NO.
-3. It refers to the sample's fields by name in backticks, e.g. `description`.
-4. It can be judged from the sample's own content in a second by a
-   knowledgeable reader. Avoid arithmetic, counting, date comparison and
-   precise numeric thresholds.
-5. It describes a general pattern. Never quote a sample, and never name a
-   specific person, company, place or number that appears in a sample.
-6. It is phrased positively, so that "true" means the condition is present.
-"""
+Good heuristics are:
+- general: drawn from domain knowledge and true of many cases, not one sample
+- focused: one signal each, grounded in the case's fields (e.g. `profile`)
+- clean: no quotes, names or exact numbers taken from the samples
 
-GEN_SYSTEM = f"""\
-You design features for an interpretable binary classifier. Each feature is a
-natural-language rule. A separate model judges, for every sample, the
-probability that the rule is true; a logistic regression then learns how much
-each rule matters.
-
-{RULE_WRITING_RULES}
-Return only the rules, as a JSON object {{"rules": [..]}}.
+Return JSON: {"policies": [...]}
 """
 
 SEED_PROMPT = """\
-TASK:
-{task}
+Task: {task}
+Fields: {fields}
 
-SAMPLE FIELDS: {fields}
+Write {n} diverse heuristics. Labelled examples:
 
-Below are labelled samples. Propose {n} diverse rules capturing the signals
-that distinguish YES samples from NO samples. Cover different aspects of the
-samples rather than several wordings of one idea.
-
-YES SAMPLES:
+YES:
 {yes_block}
 
-NO SAMPLES:
+NO:
 {no_block}
 """
 
 BOOST_PROMPT = """\
-TASK:
-{task}
+Task: {task}
+Fields: {fields}
 
-SAMPLE FIELDS: {fields}
-
-The current model uses the rules below. For each rule: its weight (positive
-pushes towards YES, negative towards NO) and how often it holds. Rules already
-tried without improving the model are listed after them.
-
-CURRENT RULES:
+Current heuristics (weight: + favours YES, - favours NO):
 {rules_block}
 
-The model gets the following {label} samples WRONG: it gives them a low
-probability of being {label}. Next to them are {label} samples it gets RIGHT.
-
-{label} SAMPLES THE MODEL MISSES (with the model's P({label})):
+The model gets these {label} cases wrong:
 {hard_block}
 
-{label} SAMPLES THE MODEL GETS RIGHT (with the model's P({label})):
+and these {label} cases right:
 {contrast_block}
 
-Propose {n} NEW rules that separate the missed samples from the correctly
-handled ones, capturing signals the current rules do not already express.
-Do not restate or reword any listed rule, including those already tried.
+Write {n} new heuristics that would catch the missed cases, generalising
+beyond them. Do not repeat or reword the heuristics listed above.
 """
+
+# How each heuristic is put to Jev, as one yes/no question per sample. Must
+# contain {policy}; may contain {task}.
+DEFAULT_JEV_TEMPLATE = (
+    "Task: {task}\n"
+    "Heuristic (guidance, not a strict rule): {policy}\n"
+    "Considering this heuristic along with the full case, is the answer YES?"
+)

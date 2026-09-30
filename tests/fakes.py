@@ -47,12 +47,12 @@ class FakeGenerator:
         if self.fail_from_call is not None and len(self.prompts) >= self.fail_from_call:
             raise RuntimeError("simulated generation failure")
         n = 10
-        if "YES SAMPLES:" in prompt:  # seed round: noisy guesses incl. one real signal
+        if "Labelled examples" in prompt:  # seed round: noisy guesses incl. one real signal
             words = ["alpha"] + NOISE[:n - 1]
         else:
-            hard = _section(prompt, "MISSES", "GETS RIGHT")
-            contrast = _section(prompt, "GETS RIGHT", None)
-            current = set(RULE_RE.findall(_section(prompt, "CURRENT RULES:", "The model")))
+            hard = _section(prompt, "cases wrong:", "cases right:")
+            contrast = _section(prompt, "cases right:", None)
+            current = set(RULE_RE.findall(_section(prompt, "Current heuristics", "The model gets")))
             hc, cc = _words(hard), _words(contrast)
             diff = {w: abs(hc[w] - cc[w]) for w in VOCAB if w not in current}
             words = sorted(diff, key=lambda w: -diff[w])[:n]
