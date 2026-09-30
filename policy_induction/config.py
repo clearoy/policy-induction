@@ -58,6 +58,8 @@ class BoostConfig:
             only ever sees labels from P; every decision is scored on the
             validation pool V (the rest).
         seed_examples_per_class: Rows per class shown for the seed round.
+        one_shot_examples_per_class: Rows per class shown in one_shot mode,
+            which has a single call and so shows more than a seed round.
         hard_examples: Mis-predicted P rows shown per boosting round.
         contrast_examples: Correctly predicted P rows (same true class) shown
             alongside them.
@@ -84,6 +86,7 @@ class BoostConfig:
 
     show_fraction: float = 0.2
     seed_examples_per_class: int = 20
+    one_shot_examples_per_class: int = 50
     hard_examples: int = 20
     contrast_examples: int = 20
     rules_per_round: int = 10

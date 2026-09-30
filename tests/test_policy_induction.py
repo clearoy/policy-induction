@@ -349,3 +349,20 @@ async def test_jev_template_wraps_every_question(tmp_path):
 
     with pytest.raises(ValueError, match="policy"):
         PolicyInduction(task_description=TASK, gen_model=FakeGenerator(), jev_template="no slot")
+
+
+async def test_one_shot_generates_once_and_skips_rounds(tmp_path):
+    X, y = make_data()
+    gen = FakeGenerator()
+    model = await make_model(tmp_path, gen=gen, mode="one_shot").fit(X, y)
+    assert len(gen.prompts) == 1
+    assert model.metrics["stop_reason"] == "one_shot"
+    assert len(model.history) == 1 and model.history[0]["direction"] == "one_shot"
+    assert model.rules
+    model.save()
+    assert PolicyInduction.load(tmp_path / "run", scorer=FakeScorer()).mode == "one_shot"
+
+
+def test_invalid_mode_rejected():
+    with pytest.raises(ValueError):
+        PolicyInduction(task_description=TASK, gen_model=FakeGenerator(), mode="nope")

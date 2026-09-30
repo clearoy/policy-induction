@@ -97,6 +97,11 @@ class PolicyInduction:
             Must contain ``{policy}``; may contain ``{task}``. Training and
             prediction always use the same template.
         save_path: Directory for the answer cache, checkpoints and ``save()``.
+        mode: ``"boost"`` (default) grows the rule set round by round from the
+            model's mistakes. ``"one_shot"`` asks the LLM once for
+            ``max_policy_length`` policies (from labelled show-pool examples),
+            scores them all, and lets the L1 regression choose the weights:
+            no acceptance test, no later rounds.
     """
 
     def __init__(
@@ -112,7 +117,10 @@ class PolicyInduction:
         jev_model: str = "jev-latest",
         jev_template: str = DEFAULT_JEV_TEMPLATE,
         save_path: str | Path = "policy_induction_run",
+        mode: Literal["boost", "one_shot"] = "boost",
     ) -> None:
+        if mode not in ("boost", "one_shot"):
+            raise ValueError("mode must be 'boost' or 'one_shot'")
         if not task_description or not task_description.strip():
             raise ValueError("task_description must be non-empty")
         if not 0 < max_policy_length <= 100:
@@ -131,6 +139,7 @@ class PolicyInduction:
         self.save_path = Path(save_path)
         self.jev_model = jev_model
         self.jev_template = jev_template
+        self.mode = mode
 
         self._generator: RuleGenerator | None = (
             None if isinstance(gen_model, str) else gen_model
@@ -181,6 +190,9 @@ class PolicyInduction:
             self.tried, self.history = ckpt["tried"], ckpt["history"]
             start_round, stale = ckpt["next_round"], ckpt["stale"]
             logger.info("Resuming at round %d with %d accepted rules.", start_round, len(self.accepted))
+
+        if self.mode == "one_shot":
+            return await self._fit_one_shot(states, y01, in_p, in_v, rng, scorer, generator)
 
         cols: Dict[str, np.ndarray] = {}
         if self.accepted:
@@ -271,6 +283,37 @@ class PolicyInduction:
         self._clear_checkpoint()
         return self
 
+    async def _fit_one_shot(self, states, y01, in_p, in_v, rng, scorer, generator) -> "PolicyInduction":
+        """One generation call, score everything, fit the weights. No rounds."""
+        prompt = self._seed_prompt(states, y01, in_p, rng, n=self.max_policy_length)
+        proposed = await _generate_with_retry(generator, prompt, self.gen_temperature)
+        candidates = _dedupe([r.strip() for r in proposed if r and r.strip()], set())
+        if not candidates:
+            raise RuntimeError("The generation model returned no policies.")
+        self.tried = list(candidates)
+        cols = await self._score(scorer, states, candidates)
+        log: Dict[str, Any] = {
+            "round": 0, "direction": "one_shot", "proposed": len(proposed),
+            "rejected": {}, "accepted": [],
+        }
+        # Only the cheap checks (constant, redundant); g = 0 disables the
+        # generality check, which needs a residual.
+        kept = self._filter(candidates, cols, np.zeros(len(y01)), in_p, in_v, log)
+        self.accepted = kept[: self.max_policy_length]
+        self.rejected = [r for r in candidates if r not in set(self.accepted)]
+        log["accepted"] = [{"rule": r} for r in self.accepted]
+        log["n_accepted"] = len(self.accepted)
+        self.history.append(log)
+        logger.info("One-shot: %d policies proposed, %d kept.", len(candidates), len(self.accepted))
+        if not self.accepted:
+            raise RuntimeError("No policy survived the filters.")
+
+        self._fit_final(cols, y01, in_p, in_v)
+        self.jev_version = getattr(scorer, "version", None)
+        self.metrics["stop_reason"] = "one_shot"
+        self.metrics["fitted_at"] = datetime.now(timezone.utc).isoformat()
+        return self
+
     async def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """P(YES) per row. NaN for rows Jev could not score at all."""
         self._check_fitted()
@@ -316,14 +359,15 @@ class PolicyInduction:
         p, models = oof_proba(X, y01, folds, C, wc)
         return _Eval(C, p, models, float(row_log_loss(y01[in_v], p[in_v]).mean()))
 
-    def _seed_prompt(self, states, y01, in_p, rng) -> str:
-        k = self.boost_config.seed_examples_per_class
+    def _seed_prompt(self, states, y01, in_p, rng, n: int | None = None) -> str:
+        bc = self.boost_config
+        k = bc.one_shot_examples_per_class if n else bc.seed_examples_per_class
         yes = _sample(np.where(in_p & (y01 == 1))[0], k, rng)
         no = _sample(np.where(in_p & (y01 == 0))[0], k, rng)
         return SEED_PROMPT.format(
             task=self.task_description,
             fields=", ".join(f"`{f}`" for f in self.fields),
-            n=self.boost_config.rules_per_round,
+            n=n or self.boost_config.rules_per_round,
             yes_block=_block(states, yes),
             no_block=_block(states, no),
         )
@@ -526,6 +570,7 @@ class PolicyInduction:
             "boost_config": asdict(self.boost_config),
             "jev_version": self.jev_version,
             "jev_template": self.jev_template,
+            "mode": self.mode,
             "fields": self.fields,
             "rules": self.rules,
             "accepted": self.accepted,
@@ -567,6 +612,7 @@ class PolicyInduction:
             jev_model=m["jev_version"] or "jev-latest",
             # Older manifests predate the template and judged the bare policy.
             jev_template=m.get("jev_template", "{policy}"),
+            mode=m.get("mode", "boost"),
             save_path=base,
         )
         inst.jev_version = m["jev_version"]
@@ -619,6 +665,10 @@ class PolicyInduction:
                   "|---|---|---|---|---|---|---|"]
         for h in self.history:
             rej = ", ".join(f"{k} {v}" for k, v in h["rejected"].items()) or "-"
+            if "val_log_loss_before" not in h:  # one-shot: no round-by-round loss
+                lines.append(f"| {h['round']} | {h['direction']} | {h['proposed']} "
+                             f"| {len(h['accepted'])} | {rej} | - | - |")
+                continue
             lines.append(
                 f"| {h['round']} | {h['direction']} | {h['proposed']} | {len(h['accepted'])} "
                 f"| {rej} | {h['val_log_loss_before']:.4f} → {h['val_log_loss_after']:.4f} "

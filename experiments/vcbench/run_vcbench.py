@@ -110,7 +110,7 @@ def test_metrics(y_true: np.ndarray, p: np.ndarray, threshold: float) -> dict:
     }
 
 
-async def run(name: str) -> None:
+async def run(name: str, mode: str) -> None:
     commit = git_commit()  # the code this run executes, captured before it can change
     X_train, y_train, _ = load_split("public")
     X_test, y_test, test_ids = load_split("private")
@@ -125,7 +125,7 @@ async def run(name: str) -> None:
     scorer = JevScorer(cache_path=out / "jev_cache.sqlite")
     model = PolicyInduction(
         task_description=TASK, gen_model=GEN_MODEL, scorer=scorer,
-        jev_template=JEV_TEMPLATE, save_path=out,
+        jev_template=JEV_TEMPLATE, save_path=out, mode=mode,
     )
     started = time.monotonic()
     try:
@@ -153,6 +153,7 @@ async def run(name: str) -> None:
             "name": name,
             "git_commit": commit,
             "gen_model": GEN_MODEL,
+            "mode": mode,
             "jev_template": JEV_TEMPLATE,
             "jev_version": model.jev_version,
             "n_rules": len(model.rules),
@@ -184,13 +185,15 @@ async def run(name: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run PolicyInduction on VCBench.")
     ap.add_argument("--name", default="default", help="run folder; re-use it to resume")
+    ap.add_argument("--mode", choices=["boost", "one_shot"], default="boost",
+                    help="boost (default) or one_shot (a single generation call)")
     args = ap.parse_args()
 
     load_dotenv(ROOT / ".env")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for noisy in ("httpx", "httpx2", "openai", "typesafe_sdk"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    asyncio.run(run(args.name))
+    asyncio.run(run(args.name, args.mode))
 
 
 if __name__ == "__main__":

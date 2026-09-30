@@ -128,6 +128,7 @@ Reload a saved model with `PolicyInduction.load("runs/my_run")`.
 | `gen_temperature` | 1.0 | Sampling temperature of the rule-writing LLM |
 | `random_state` | 0 | P/V split, example selection and CV folds. **Does not control the LLM** |
 | `jev_template` | generic | How each heuristic is put to Jev; must contain `{policy}`, may contain `{task}` |
+| `mode` | `boost` | `boost` grows the rule set from the model's mistakes; `one_shot` asks the LLM once for `max_policy_length` heuristics (shown 50 YES + 50 NO show-pool rows, `BoostConfig.one_shot_examples_per_class`), scores them all and lets L1 choose weights (no acceptance test, no rounds) |
 | `weight_config` | `WeightConfig()` | `beta` (threshold only), `Cs`, `cv_folds`, `cv_repeats`, `one_se_rule`, `class_weight_balanced` |
 
 `BoostConfig` holds the internal boosting constants (show-pool share, rules per
@@ -167,7 +168,8 @@ think-reason-learn runs) and evaluates on all private rows, writing heuristics
 with `deepseek-v4-pro` and scoring them with an investor-heuristic Jev
 template. Settings such as the generation model and the template live as
 constants at the top of the script. Re-running
-resumes an interrupted run; `--name` keeps separate runs apart.
+resumes an interrupted run; `--name` keeps separate runs apart, and `--mode one_shot` runs the
+single-generation variant (default `boost`).
 
 Results go to `experiments/vcbench/runs/<name>/` (gitignored): `report.md`,
 `model.json`, `predictions.csv`, `metrics.json` (validation and test metrics,
