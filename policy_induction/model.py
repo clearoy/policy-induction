@@ -97,11 +97,11 @@ class PolicyInduction:
             Must contain ``{policy}``; may contain ``{task}``. Training and
             prediction always use the same template.
         save_path: Directory for the answer cache, checkpoints and ``save()``.
-        mode: ``"boost"`` (default) grows the rule set round by round from the
-            model's mistakes. ``"one_shot"`` asks the LLM once for
+        mode: ``"one_shot"`` (default) asks the LLM once for
             ``max_policy_length`` policies (from labelled show-pool examples),
             scores them all, and lets the L1 regression choose the weights:
-            no acceptance test, no later rounds.
+            no acceptance test, no later rounds. ``"boost"`` instead grows
+            the rule set round by round from the model's mistakes.
     """
 
     def __init__(
@@ -117,7 +117,7 @@ class PolicyInduction:
         jev_model: str = "jev-latest",
         jev_template: str = DEFAULT_JEV_TEMPLATE,
         save_path: str | Path = "policy_induction_run",
-        mode: Literal["boost", "one_shot"] = "boost",
+        mode: Literal["boost", "one_shot"] = "one_shot",
     ) -> None:
         if mode not in ("boost", "one_shot"):
             raise ValueError("mode must be 'boost' or 'one_shot'")

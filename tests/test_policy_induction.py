@@ -14,6 +14,7 @@ TASK = "Predict whether the text belongs to the positive class."
 
 
 def make_model(tmp_path, gen=None, **kw):
+    kw.setdefault("mode", "boost")  # most tests exercise the boosting loop
     return PolicyInduction(
         task_description=TASK,
         gen_model=gen or FakeGenerator(),
@@ -320,7 +321,7 @@ async def test_fit_refuses_to_train_on_missing_scores(tmp_path):
 
     model = PolicyInduction(
         task_description=TASK, gen_model=FakeGenerator(), scorer=HoleyScorer(),
-        save_path=tmp_path / "run",
+        save_path=tmp_path / "run", mode="boost",
     )
     with pytest.raises(RuntimeError, match="could not be scored"):
         await model.fit(X, y)

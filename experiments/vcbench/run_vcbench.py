@@ -185,8 +185,8 @@ async def run(name: str, mode: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run PolicyInduction on VCBench.")
     ap.add_argument("--name", default="default", help="run folder; re-use it to resume")
-    ap.add_argument("--mode", choices=["boost", "one_shot"], default="boost",
-                    help="boost (default) or one_shot (a single generation call)")
+    ap.add_argument("--mode", choices=["boost", "one_shot"], default="one_shot",
+                    help="one_shot (default, a single generation call) or boost")
     args = ap.parse_args()
 
     load_dotenv(ROOT / ".env")
